@@ -197,6 +197,19 @@ def _piece_label(piece: Any, square: int) -> str:
     return f"{color_prefix}{_piece_symbol(piece)}@{chess.square_name(square)}"
 
 
+def _effective_attacker_count(board: Any, attacker_color: bool, target_square: int) -> int:
+    if chess is None:
+        raise RuntimeError("python-chess is required for Stockfish hint extraction")
+
+    count = 0
+    for attacker_square in board.attackers(attacker_color, target_square):
+        if board.is_pinned(attacker_color, attacker_square):
+            if target_square not in board.pin(attacker_color, attacker_square):
+                continue
+        count += 1
+    return count
+
+
 def summarize_threats(board: Any) -> ThreatSummary:
     if chess is None:
         raise RuntimeError("python-chess is required for Stockfish hint extraction")
@@ -208,14 +221,14 @@ def summarize_threats(board: Any) -> ThreatSummary:
     opponent_threatened_count = 0
 
     for square, piece in board.piece_map().items():
-        attackers = board.attackers(not piece.color, square)
-        defenders = board.attackers(piece.color, square)
-        if attackers:
+        num_attackers = _effective_attacker_count(board, not piece.color, square)
+        num_defenders = _effective_attacker_count(board, piece.color, square)
+        if num_attackers > 0:
             if piece.color == side:
                 side_threatened_count += 1
             else:
                 opponent_threatened_count += 1
-        if attackers and not defenders:
+        if num_attackers > 0 and num_defenders == 0:
             label = _piece_label(piece, square)
             if piece.color == side:
                 side_hanging.append(label)
@@ -283,10 +296,10 @@ def _piece_pressure_lines(board: Any, color: bool, max_items: int) -> tuple[str,
     for square, piece in board.piece_map().items():
         if piece.color != color:
             continue
-        num_attackers = len(board.attackers(not color, square))
+        num_attackers = _effective_attacker_count(board, not color, square)
         if num_attackers == 0:
             continue
-        num_defenders = len(board.attackers(color, square))
+        num_defenders = _effective_attacker_count(board, color, square)
         if num_defenders == 0:
             status = "hanging"
             severity = 2
@@ -328,10 +341,10 @@ def _weak_king_zone_squares(board: Any, color: bool, max_items: int) -> tuple[st
     ring = chess.SquareSet(chess.BB_KING_ATTACKS[king_square] | chess.BB_SQUARES[king_square])
     scored_squares: list[tuple[tuple[int, int], str]] = []
     for square in ring:
-        num_attackers = len(board.attackers(not color, square))
+        num_attackers = _effective_attacker_count(board, not color, square)
         if num_attackers == 0:
             continue
-        num_defenders = len(board.attackers(color, square))
+        num_defenders = _effective_attacker_count(board, color, square)
         if num_defenders > 0:
             continue
         sort_key = (
@@ -470,9 +483,9 @@ def _move_hangs_piece(board: Any, move: Any) -> bool:
     moved_board = board.copy(stack=False)
     moved_board.push(move)
     moved_square = move.to_square
-    attackers = moved_board.attackers(moved_board.turn, moved_square)
-    defenders = moved_board.attackers(not moved_board.turn, moved_square)
-    return bool(attackers) and not bool(defenders)
+    num_attackers = _effective_attacker_count(moved_board, moved_board.turn, moved_square)
+    num_defenders = _effective_attacker_count(moved_board, not moved_board.turn, moved_square)
+    return num_attackers > 0 and num_defenders == 0
 
 
 def _pv_to_san(board: Any, pv: Sequence[Any], max_pv_plies: int) -> tuple[str, ...]:

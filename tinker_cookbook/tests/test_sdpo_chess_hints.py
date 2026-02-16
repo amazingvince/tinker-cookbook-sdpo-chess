@@ -52,6 +52,27 @@ def test_summarize_threats_hanging_piece_counts():
     assert summary.opponent_threatened_count >= 1
 
 
+def test_summarize_threats_ignores_pinned_defender():
+    board = chess.Board("4r2k/6b1/8/8/3P4/8/4N3/4K3 w - - 0 1")
+    summary = summarize_threats(board)
+    assert "wP@d4" in summary.side_to_move_hanging
+
+
+def test_fen_decode_ignores_pinned_attacker_pressure():
+    fen = "4k3/4n3/8/3P4/8/8/8/4R2K w - - 0 1"
+    board = chess.Board(fen)
+    pack = PositionHintPack(
+        fen=fen,
+        side_to_move="w",
+        root_wdl=wdl_to_stats(500, 300, 200),
+        threat_summary=summarize_threats(board),
+        candidate_moves=(),
+    )
+    text = render_hint_text(pack, StockfishHintConfig(include_fen_decode=True))
+    assert "Threat summary: threatened_own=0" in text
+    assert "white pieces under pressure: none" in text
+
+
 def test_render_hint_text_includes_good_and_bad_move_sections():
     pack = PositionHintPack(
         fen="8/8/8/8/8/8/8/K6k w - - 0 1",
