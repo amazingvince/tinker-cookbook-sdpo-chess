@@ -98,10 +98,25 @@ def test_render_hint_text_includes_good_and_bad_move_sections():
         StockfishHintConfig(max_good_moves=2, max_bad_moves=2, bad_move_threshold=0.05),
     )
     assert "Root expected score (WDL)" in text
+    assert "Position decode from FEN:" in text
+    assert "Board (white uppercase, black lowercase):" in text
+    assert "pieces under pressure" in text
+    assert "Weak king-zone squares" in text
     assert "Top candidate moves by expected score:" in text
     assert "Moves likely to be bad:" in text
     assert "cp=+35.0" in text
     assert "hangs moved piece" in text
+
+    no_decode_text = render_hint_text(
+        pack,
+        StockfishHintConfig(
+            include_fen_decode=False,
+            max_good_moves=2,
+            max_bad_moves=2,
+            bad_move_threshold=0.05,
+        ),
+    )
+    assert "Position decode from FEN:" not in no_decode_text
 
 
 def test_extract_predicted_move_from_uci_and_san():

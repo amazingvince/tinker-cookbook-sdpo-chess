@@ -134,6 +134,10 @@ class Config:
     stockfish_hint_max_good_moves: int = 3
     stockfish_hint_max_bad_moves: int = 3
     stockfish_hint_bad_move_threshold: float = 0.05
+    stockfish_include_fen_decode: bool = True
+    stockfish_include_ascii_board: bool = True
+    stockfish_max_piece_pressure_items: int = 8
+    stockfish_max_weak_square_items: int = 8
     stockfish_hints_template: str = (
         "\nStockfish position hints (WDL expected score):\n\n{stockfish_hints}\n\n"
     )
@@ -1279,6 +1283,10 @@ async def main(config: Config):
                     max_good_moves=config.stockfish_hint_max_good_moves,
                     max_bad_moves=config.stockfish_hint_max_bad_moves,
                     bad_move_threshold=config.stockfish_hint_bad_move_threshold,
+                    include_fen_decode=config.stockfish_include_fen_decode,
+                    include_ascii_board=config.stockfish_include_ascii_board,
+                    max_piece_pressure_items=config.stockfish_max_piece_pressure_items,
+                    max_weak_square_items=config.stockfish_max_weak_square_items,
                 )
             )
             logger.info("Stockfish hints enabled via %s", config.stockfish_path)

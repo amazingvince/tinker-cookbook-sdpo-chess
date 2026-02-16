@@ -86,6 +86,8 @@ python -m tinker_cookbook.recipes.verifiers_rl.sdpo_train \
   stockfish_verification_depth=20 \
   include_stockfish_move_feedback=true \
   stockfish_feedback_cp_loss_threshold=20 \
+  stockfish_include_fen_decode=true \
+  stockfish_include_ascii_board=true \
   stockfish_wdl_model=sf
 ```
 
@@ -93,6 +95,7 @@ If enabled, teacher reprompts can include:
 - root WDL expected score (`E = p(win) + 0.5 * p(draw)`);
 - top candidate moves with `delta_E` vs the best line;
 - threat summaries (hanging pieces, threatened pieces, checking opportunities);
+- FEN-decoded board context (material, king squares, pieces under pressure, weak king-zone squares);
 - "moves likely to be bad" explanations with refutation context when available.
 - detailed Stockfish move-verification feedback including:
   - model predicted move vs Stockfish best move at depth 20;

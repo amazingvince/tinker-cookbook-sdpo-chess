@@ -21,6 +21,14 @@ _FEN_RE = re.compile(
     r"((?:[pnbrqkPNBRQK1-8]{1,8}/){7}[pnbrqkPNBRQK1-8]{1,8}\s[wb]\s(?:-|[KQkq]{1,4})\s(?:-|[a-h][36])\s\d+\s\d+)"
 )
 _UCI_MOVE_RE = re.compile(r"\b([a-h][1-8][a-h][1-8][qrbn]?)\b", flags=re.IGNORECASE)
+_PIECE_TYPE_VALUES = {
+    1: 1,  # pawn
+    2: 3,  # knight
+    3: 3,  # bishop
+    4: 5,  # rook
+    5: 9,  # queen
+    6: 0,  # king
+}
 
 
 @dataclass(frozen=True)
@@ -76,6 +84,10 @@ class StockfishHintConfig:
     max_good_moves: int = 3
     max_bad_moves: int = 3
     bad_move_threshold: float = 0.05
+    include_fen_decode: bool = True
+    include_ascii_board: bool = True
+    max_piece_pressure_items: int = 8
+    max_weak_square_items: int = 8
 
 
 @dataclass(frozen=True)
@@ -220,6 +232,178 @@ def summarize_threats(board: Any) -> ThreatSummary:
     )
 
 
+def _material_signature(board: Any, color: bool) -> str:
+    if chess is None:
+        raise RuntimeError("python-chess is required for Stockfish hint extraction")
+
+    counts = {
+        chess.KING: 0,
+        chess.QUEEN: 0,
+        chess.ROOK: 0,
+        chess.BISHOP: 0,
+        chess.KNIGHT: 0,
+        chess.PAWN: 0,
+    }
+    for piece in board.piece_map().values():
+        if piece.color == color:
+            counts[piece.piece_type] += 1
+
+    material_points = sum(
+        counts[piece_type] * _PIECE_TYPE_VALUES[piece_type]
+        for piece_type in (chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN)
+    )
+    return (
+        f"K{counts[chess.KING]} Q{counts[chess.QUEEN]} R{counts[chess.ROOK]} "
+        f"B{counts[chess.BISHOP]} N{counts[chess.KNIGHT]} P{counts[chess.PAWN]} "
+        f"(points={material_points})"
+    )
+
+
+def _board_ascii(board: Any) -> str:
+    if chess is None:
+        raise RuntimeError("python-chess is required for Stockfish hint extraction")
+
+    lines: list[str] = []
+    for rank in range(7, -1, -1):
+        row: list[str] = []
+        for file_idx in range(8):
+            square = chess.square(file_idx, rank)
+            piece = board.piece_at(square)
+            row.append(piece.symbol() if piece else ".")
+        lines.append(f"{rank + 1} " + " ".join(row))
+    lines.append("  a b c d e f g h")
+    return "\n".join(lines)
+
+
+def _piece_pressure_lines(board: Any, color: bool, max_items: int) -> tuple[str, ...]:
+    if chess is None:
+        raise RuntimeError("python-chess is required for Stockfish hint extraction")
+
+    scored_lines: list[tuple[tuple[int, int, int], str]] = []
+    for square, piece in board.piece_map().items():
+        if piece.color != color:
+            continue
+        num_attackers = len(board.attackers(not color, square))
+        if num_attackers == 0:
+            continue
+        num_defenders = len(board.attackers(color, square))
+        if num_defenders == 0:
+            status = "hanging"
+            severity = 2
+        elif num_attackers > num_defenders:
+            status = "underdefended"
+            severity = 1
+        else:
+            status = "contested"
+            severity = 0
+
+        piece_value = _PIECE_TYPE_VALUES[piece.piece_type]
+        sort_key = (
+            severity,
+            num_attackers - num_defenders,
+            piece_value,
+        )
+        scored_lines.append(
+            (
+                sort_key,
+                (
+                    f"{_piece_label(piece, square)} attacked_by={num_attackers} "
+                    f"defended_by={num_defenders} ({status})"
+                ),
+            )
+        )
+
+    scored_lines.sort(key=lambda item: item[0], reverse=True)
+    return tuple(line for _score, line in scored_lines[: max(0, max_items)])
+
+
+def _weak_king_zone_squares(board: Any, color: bool, max_items: int) -> tuple[str, ...]:
+    if chess is None:
+        raise RuntimeError("python-chess is required for Stockfish hint extraction")
+
+    king_square = board.king(color)
+    if king_square is None:
+        return ()
+
+    ring = chess.SquareSet(chess.BB_KING_ATTACKS[king_square] | chess.BB_SQUARES[king_square])
+    scored_squares: list[tuple[tuple[int, int], str]] = []
+    for square in ring:
+        num_attackers = len(board.attackers(not color, square))
+        if num_attackers == 0:
+            continue
+        num_defenders = len(board.attackers(color, square))
+        if num_defenders > 0:
+            continue
+        sort_key = (
+            num_attackers,
+            _PIECE_TYPE_VALUES.get(board.piece_type_at(square) or chess.PAWN, 0),
+        )
+        scored_squares.append(
+            (
+                sort_key,
+                f"{chess.square_name(square)}(atk={num_attackers})",
+            )
+        )
+    scored_squares.sort(key=lambda item: item[0], reverse=True)
+    return tuple(name for _score, name in scored_squares[: max(0, max_items)])
+
+
+def _fen_decode_lines(pack: PositionHintPack, config: StockfishHintConfig) -> list[str]:
+    if chess is None:
+        return []
+
+    board = chess.Board(pack.fen)
+    side_to_move = board.turn
+    opponent = not side_to_move
+    side_name = "white" if side_to_move == chess.WHITE else "black"
+    opponent_name = "white" if opponent == chess.WHITE else "black"
+
+    white_king = board.king(chess.WHITE)
+    black_king = board.king(chess.BLACK)
+    white_king_square = chess.square_name(white_king) if white_king is not None else "missing"
+    black_king_square = chess.square_name(black_king) if black_king is not None else "missing"
+
+    side_pressure = _piece_pressure_lines(board, side_to_move, config.max_piece_pressure_items)
+    opponent_pressure = _piece_pressure_lines(board, opponent, config.max_piece_pressure_items)
+    side_weak_king_zone = _weak_king_zone_squares(
+        board, side_to_move, config.max_weak_square_items
+    )
+    opponent_weak_king_zone = _weak_king_zone_squares(
+        board, opponent, config.max_weak_square_items
+    )
+
+    lines: list[str] = ["Position decode from FEN:"]
+    if config.include_ascii_board:
+        lines.append("Board (white uppercase, black lowercase):")
+        lines.extend(_board_ascii(board).splitlines())
+
+    lines.append(
+        "Material: "
+        f"white[{_material_signature(board, chess.WHITE)}], "
+        f"black[{_material_signature(board, chess.BLACK)}]"
+    )
+    lines.append(f"Kings: white@{white_king_square}, black@{black_king_square}")
+
+    lines.append(
+        f"{side_name} pieces under pressure: "
+        + (", ".join(side_pressure) if side_pressure else "none")
+    )
+    lines.append(
+        f"{opponent_name} pieces under pressure: "
+        + (", ".join(opponent_pressure) if opponent_pressure else "none")
+    )
+
+    lines.append(
+        f"Weak king-zone squares for {side_name}: "
+        + (", ".join(side_weak_king_zone) if side_weak_king_zone else "none")
+    )
+    lines.append(
+        f"Weak king-zone squares for {opponent_name}: "
+        + (", ".join(opponent_weak_king_zone) if opponent_weak_king_zone else "none")
+    )
+    return lines
+
+
 def _score_to_wdl_stats(score: Any, board: Any, wdl_model: str) -> WdlStats:
     if chess is None:
         raise RuntimeError("python-chess is required for Stockfish hint extraction")
@@ -359,6 +543,8 @@ def render_hint_text(pack: PositionHintPack, config: StockfishHintConfig) -> str
         )
     if pack.threat_summary.opponent_hanging:
         lines.append("Hanging opponent pieces: " + ", ".join(pack.threat_summary.opponent_hanging))
+    if config.include_fen_decode:
+        lines.extend(_fen_decode_lines(pack, config))
 
     if pack.candidate_moves:
         lines.append("Top candidate moves by expected score:")
