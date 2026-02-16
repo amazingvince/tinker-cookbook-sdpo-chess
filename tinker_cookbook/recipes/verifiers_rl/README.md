@@ -110,7 +110,7 @@ python -m tinker_cookbook.recipes.verifiers_rl.sdpo_train \
 If enabled, teacher reprompts can include:
 - root WDL expected score (`E = p(win) + 0.5 * p(draw)`);
 - root search stats (depth/seldepth/nodes/nps/tbhits when available);
-- optional Syzygy tablebase root outcome/DTZ for <= `stockfish_syzygy_max_pieces`;
+- optional Syzygy tablebase root outcome/DTZ for <= `stockfish_syzygy_max_pieces` (default `5`, aligned with `3-4-5` tablebases);
 - top candidate moves with `delta_E` vs the best line;
 - threat summaries (hanging pieces, threatened pieces, checking opportunities);
 - FEN-decoded board context (material, king squares, pieces under pressure, weak king-zone squares);

@@ -217,7 +217,7 @@ stockfish_include_fen_decode=true \
 stockfish_include_ascii_board=true \
 stockfish_include_search_stats=true \
 stockfish_syzygy_path=/path/to/syzygy \
-stockfish_syzygy_max_pieces=7
+stockfish_syzygy_max_pieces=5
 ```
 
 Relevant metrics:

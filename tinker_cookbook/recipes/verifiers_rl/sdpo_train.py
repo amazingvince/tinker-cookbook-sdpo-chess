@@ -85,7 +85,7 @@ class CLIConfig:
     stockfish_max_piece_pressure_items: int = 8
     stockfish_max_weak_square_items: int = 8
     stockfish_syzygy_path: str | None = None
-    stockfish_syzygy_max_pieces: int = 7
+    stockfish_syzygy_max_pieces: int = 5
     stockfish_unknown_score_cp_loss: float = 80.0
     stockfish_hints_template: str = (
         "\nStockfish position hints (WDL expected score):\n\n{stockfish_hints}\n\n"
