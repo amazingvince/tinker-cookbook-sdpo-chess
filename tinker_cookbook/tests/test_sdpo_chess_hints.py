@@ -11,6 +11,7 @@ from tinker_cookbook.sdpo.chess_hints import (  # noqa: E402
     PositionHintPack,
     StockfishHintConfig,
     ThreatSummary,
+    _compute_cp_loss,
     build_stockfish_hint_text_for_state,
     extract_fen_from_state,
     extract_fen_from_text,
@@ -138,6 +139,84 @@ def test_render_hint_text_includes_good_and_bad_move_sections():
         ),
     )
     assert "Position decode from FEN:" not in no_decode_text
+
+
+def test_render_hint_text_includes_search_and_syzygy_summary():
+    pack = PositionHintPack(
+        fen="8/8/8/8/8/8/8/K6k w - - 0 1",
+        side_to_move="w",
+        root_wdl=wdl_to_stats(540, 300, 160),
+        threat_summary=ThreatSummary(
+            side_to_move_hanging=(),
+            opponent_hanging=(),
+            side_to_move_threatened_count=0,
+            opponent_threatened_count=0,
+            legal_checking_moves=0,
+        ),
+        candidate_moves=(),
+        root_centipawn_score=22.0,
+        root_search_depth=18,
+        root_selective_depth=28,
+        root_nodes=1_250_000,
+        root_nps=4_500_000,
+        root_tablebase_hits=12,
+        syzygy_root_wdl=2,
+        syzygy_root_dtz=7,
+    )
+    text = render_hint_text(pack, StockfishHintConfig(include_search_stats=True))
+    assert "Root centipawn score (side to move): +22.0" in text
+    assert "Root search stats: d=18, sd=28, nodes=1.2M, nps=4.5M, tbhits=12" in text
+    assert "Syzygy root: tablebase win, DTZ=7" in text
+
+
+def test_compute_cp_loss_sources():
+    cp_loss, source = _compute_cp_loss(
+        best_cp=40.0,
+        predicted_cp=-10.0,
+        best_expected_score=None,
+        predicted_expected_score=None,
+        best_move_uci="e2e4",
+        predicted_move_uci="d2d4",
+        unknown_score_cp_loss=80.0,
+    )
+    assert cp_loss == 50.0
+    assert source == "centipawn"
+
+    cp_loss, source = _compute_cp_loss(
+        best_cp=None,
+        predicted_cp=None,
+        best_expected_score=0.72,
+        predicted_expected_score=0.55,
+        best_move_uci="e2e4",
+        predicted_move_uci="d2d4",
+        unknown_score_cp_loss=80.0,
+    )
+    assert cp_loss == pytest.approx(170.0, rel=1e-6)
+    assert source == "wdl_scaled"
+
+    cp_loss, source = _compute_cp_loss(
+        best_cp=None,
+        predicted_cp=None,
+        best_expected_score=None,
+        predicted_expected_score=None,
+        best_move_uci="e2e4",
+        predicted_move_uci="d2d4",
+        unknown_score_cp_loss=80.0,
+    )
+    assert cp_loss == 80.0
+    assert source == "fallback_penalty"
+
+    cp_loss, source = _compute_cp_loss(
+        best_cp=None,
+        predicted_cp=None,
+        best_expected_score=None,
+        predicted_expected_score=None,
+        best_move_uci="e2e4",
+        predicted_move_uci="e2e4",
+        unknown_score_cp_loss=80.0,
+    )
+    assert cp_loss == 0.0
+    assert source == "same_move"
 
 
 def test_extract_predicted_move_from_uci_and_san():

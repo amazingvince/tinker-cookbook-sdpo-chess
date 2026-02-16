@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import logging
+import os
 import random
 import re
 from collections.abc import Mapping, Sequence
@@ -14,6 +15,12 @@ try:
     import chess.pgn
 except ImportError:  # pragma: no cover - guarded at runtime
     chess = None
+
+if chess is not None:  # pragma: no branch
+    try:
+        import chess.syzygy
+    except ImportError:  # pragma: no cover - optional dependency
+        pass
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +36,7 @@ _PIECE_TYPE_VALUES = {
     5: 9,  # queen
     6: 0,  # king
 }
+_WDL_CP_LOSS_SCALE = 1000.0
 
 
 @dataclass(frozen=True)
@@ -61,6 +69,11 @@ class MoveHint:
     is_promotion: bool
     hangs_moved_piece: bool
     centipawn_score: float | None = None
+    search_depth: int | None = None
+    selective_depth: int | None = None
+    nodes: int | None = None
+    nps: int | None = None
+    tablebase_hits: int | None = None
 
 
 @dataclass(frozen=True)
@@ -70,6 +83,14 @@ class PositionHintPack:
     root_wdl: WdlStats
     threat_summary: ThreatSummary
     candidate_moves: tuple[MoveHint, ...]
+    root_centipawn_score: float | None = None
+    root_search_depth: int | None = None
+    root_selective_depth: int | None = None
+    root_nodes: int | None = None
+    root_nps: int | None = None
+    root_tablebase_hits: int | None = None
+    syzygy_root_wdl: int | None = None
+    syzygy_root_dtz: int | None = None
 
 
 @dataclass(frozen=True)
@@ -86,8 +107,12 @@ class StockfishHintConfig:
     bad_move_threshold: float = 0.05
     include_fen_decode: bool = True
     include_ascii_board: bool = True
+    include_search_stats: bool = True
     max_piece_pressure_items: int = 8
     max_weak_square_items: int = 8
+    syzygy_path: str | None = None
+    syzygy_max_pieces: int = 7
+    unknown_score_cp_loss: float = 80.0
 
 
 @dataclass(frozen=True)
@@ -102,10 +127,17 @@ class MoveVerification:
     predicted_centipawn: float | None
     best_centipawn: float | None
     cp_loss: float
+    cp_loss_source: str
     predicted_expected_score: float | None
     best_expected_score: float | None
     predicted_pv_san: tuple[str, ...]
     best_pv_san: tuple[str, ...]
+    syzygy_root_wdl: int | None
+    syzygy_root_dtz: int | None
+    syzygy_predicted_wdl: int | None
+    syzygy_predicted_dtz: int | None
+    syzygy_best_wdl: int | None
+    syzygy_best_dtz: int | None
     feedback_text: str
 
 
@@ -452,6 +484,98 @@ def _score_to_centipawn(score: Any, board: Any, mate_score: int = 10000) -> floa
     return float(centipawn)
 
 
+def _to_optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_large_int(value: int | None) -> str | None:
+    if value is None:
+        return None
+    abs_value = abs(value)
+    if abs_value >= 1_000_000_000:
+        return f"{value / 1_000_000_000:.1f}B"
+    if abs_value >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M"
+    if abs_value >= 1_000:
+        return f"{value / 1_000:.1f}k"
+    return str(value)
+
+
+def _format_search_stats(
+    depth: int | None,
+    selective_depth: int | None,
+    nodes: int | None,
+    nps: int | None,
+    tablebase_hits: int | None,
+) -> str | None:
+    parts: list[str] = []
+    if depth is not None:
+        parts.append(f"d={depth}")
+    if selective_depth is not None:
+        parts.append(f"sd={selective_depth}")
+    formatted_nodes = _format_large_int(nodes)
+    if formatted_nodes is not None:
+        parts.append(f"nodes={formatted_nodes}")
+    formatted_nps = _format_large_int(nps)
+    if formatted_nps is not None:
+        parts.append(f"nps={formatted_nps}")
+    formatted_tbhits = _format_large_int(tablebase_hits)
+    if formatted_tbhits is not None:
+        parts.append(f"tbhits={formatted_tbhits}")
+    if not parts:
+        return None
+    return ", ".join(parts)
+
+
+def _syzygy_wdl_label(wdl: int) -> str:
+    if wdl >= 2:
+        return "tablebase win"
+    if wdl == 1:
+        return "cursed win"
+    if wdl == 0:
+        return "draw"
+    if wdl == -1:
+        return "blessed loss"
+    return "tablebase loss"
+
+
+def _compute_cp_loss(
+    best_cp: float | None,
+    predicted_cp: float | None,
+    best_expected_score: float | None,
+    predicted_expected_score: float | None,
+    best_move_uci: str | None,
+    predicted_move_uci: str | None,
+    unknown_score_cp_loss: float,
+) -> tuple[float, str]:
+    if best_cp is not None and predicted_cp is not None:
+        return max(0.0, float(best_cp - predicted_cp)), "centipawn"
+
+    if best_expected_score is not None and predicted_expected_score is not None:
+        scaled_loss = max(
+            0.0,
+            float(best_expected_score - predicted_expected_score) * _WDL_CP_LOSS_SCALE,
+        )
+        return scaled_loss, "wdl_scaled"
+
+    if (
+        best_move_uci is not None
+        and predicted_move_uci is not None
+        and best_move_uci == predicted_move_uci
+    ):
+        return 0.0, "same_move"
+
+    if best_move_uci is not None and predicted_move_uci is not None:
+        return max(0.0, float(unknown_score_cp_loss)), "fallback_penalty"
+
+    return 0.0, "unavailable"
+
+
 def extract_predicted_move(board: Any, predicted_text: str) -> Any | None:
     if chess is None:
         raise RuntimeError("python-chess is required for Stockfish hint extraction")
@@ -515,6 +639,11 @@ def _extract_move_hint_from_info(
     move_score = _score_to_wdl_stats(info.get("score"), board, config.wdl_model)
     centipawn_score = _score_to_centipawn(info.get("score"), board)
     pv_san = _pv_to_san(board, pv, config.max_pv_plies)
+    search_depth = _to_optional_int(info.get("depth"))
+    selective_depth = _to_optional_int(info.get("seldepth"))
+    nodes = _to_optional_int(info.get("nodes"))
+    nps = _to_optional_int(info.get("nps"))
+    tablebase_hits = _to_optional_int(info.get("tbhits"))
 
     return MoveHint(
         uci=move.uci(),
@@ -528,6 +657,11 @@ def _extract_move_hint_from_info(
         gives_check=board.gives_check(move),
         is_promotion=move.promotion is not None,
         hangs_moved_piece=_move_hangs_piece(board, move),
+        search_depth=search_depth,
+        selective_depth=selective_depth,
+        nodes=nodes,
+        nps=nps,
+        tablebase_hits=tablebase_hits,
     )
 
 
@@ -550,6 +684,23 @@ def render_hint_text(pack: PositionHintPack, config: StockfishHintConfig) -> str
             f"checking_moves={pack.threat_summary.legal_checking_moves}"
         ),
     ]
+    if pack.root_centipawn_score is not None:
+        lines.append(f"Root centipawn score (side to move): {pack.root_centipawn_score:+.1f}")
+    if config.include_search_stats:
+        root_search_stats = _format_search_stats(
+            depth=pack.root_search_depth,
+            selective_depth=pack.root_selective_depth,
+            nodes=pack.root_nodes,
+            nps=pack.root_nps,
+            tablebase_hits=pack.root_tablebase_hits,
+        )
+        if root_search_stats:
+            lines.append("Root search stats: " + root_search_stats)
+    if pack.syzygy_root_wdl is not None:
+        syzygy_text = _syzygy_wdl_label(pack.syzygy_root_wdl)
+        if pack.syzygy_root_dtz is not None:
+            syzygy_text += f", DTZ={pack.syzygy_root_dtz}"
+        lines.append("Syzygy root: " + syzygy_text)
     if pack.threat_summary.side_to_move_hanging:
         lines.append(
             "Hanging own pieces: " + ", ".join(pack.threat_summary.side_to_move_hanging)
@@ -564,9 +715,19 @@ def render_hint_text(pack: PositionHintPack, config: StockfishHintConfig) -> str
     for move in pack.candidate_moves[: config.max_good_moves]:
         pv_text = " ".join(move.pv_san) if move.pv_san else "(no pv)"
         cp_text = f"{move.centipawn_score:+.1f}" if move.centipawn_score is not None else "n/a"
+        search_stats_text = None
+        if config.include_search_stats:
+            search_stats_text = _format_search_stats(
+                depth=move.search_depth,
+                selective_depth=move.selective_depth,
+                nodes=move.nodes,
+                nps=move.nps,
+                tablebase_hits=move.tablebase_hits,
+            )
+        search_suffix = f", search={search_stats_text}" if search_stats_text else ""
         lines.append(
             f"- {move.uci} ({move.san}): E={move.expected_score:.3f}, "
-            f"delta_E={move.delta_expected_score:+.3f}, cp={cp_text}, pv={pv_text}"
+            f"delta_E={move.delta_expected_score:+.3f}, cp={cp_text}, pv={pv_text}{search_suffix}"
         )
 
     bad_moves = [
@@ -607,7 +768,9 @@ class StockfishHintExtractor:
         self._engine = chess.engine.SimpleEngine.popen_uci(config.stockfish_path)
         self._root_analysis_cache: dict[tuple[str, int, int], list[Mapping[str, Any]]] = {}
         self._move_analysis_cache: dict[tuple[str, int, str], Mapping[str, Any]] = {}
+        self._tablebase: Any | None = None
         self._configure_engine()
+        self._tablebase = self._open_tablebase(config.syzygy_path)
 
     def _configure_engine(self) -> None:
         options = {
@@ -625,6 +788,55 @@ class StockfishHintExtractor:
 
     def close(self) -> None:
         self._engine.quit()
+        if self._tablebase is not None:
+            self._tablebase.close()
+            self._tablebase = None
+
+    @staticmethod
+    def _split_syzygy_paths(path_value: str) -> list[str]:
+        paths = [segment.strip() for segment in path_value.split(os.pathsep)]
+        if len(paths) == 1 and "," in path_value:
+            paths = [segment.strip() for segment in path_value.split(",")]
+        return [path for path in paths if path]
+
+    def _open_tablebase(self, path_value: str | None) -> Any | None:
+        if not path_value:
+            return None
+        if chess is None or not hasattr(chess, "syzygy"):
+            return None
+
+        paths = self._split_syzygy_paths(path_value)
+        if not paths:
+            return None
+
+        try:
+            tablebase = chess.syzygy.open_tablebase(paths[0])
+            for extra_path in paths[1:]:
+                tablebase.add_directory(extra_path)
+            logger.info("Loaded Syzygy tablebase from %s", ", ".join(paths))
+            return tablebase
+        except Exception as exc:
+            logger.warning("Failed to load Syzygy tablebase from %s: %s", ", ".join(paths), exc)
+            return None
+
+    def _probe_syzygy(self, board: Any) -> tuple[int | None, int | None]:
+        if self._tablebase is None:
+            return None, None
+
+        if len(board.piece_map()) > max(1, self.config.syzygy_max_pieces):
+            return None, None
+
+        wdl: int | None = None
+        dtz: int | None = None
+        try:
+            wdl = int(self._tablebase.probe_wdl(board))
+        except Exception:
+            wdl = None
+        try:
+            dtz = int(self._tablebase.probe_dtz(board))
+        except Exception:
+            dtz = None
+        return wdl, dtz
 
     @staticmethod
     def _normalize_infos(raw_infos: Any) -> list[Mapping[str, Any]]:
@@ -703,12 +915,44 @@ class StockfishHintExtractor:
         if move_hints:
             root_score = replace(root_score, expected_score=move_hints[0].expected_score)
 
+        root_centipawn = _score_to_centipawn(root_info.get("score"), board)
+        root_depth = _to_optional_int(root_info.get("depth"))
+        root_selective_depth = _to_optional_int(root_info.get("seldepth"))
+        root_nodes = _to_optional_int(root_info.get("nodes"))
+        root_nps = _to_optional_int(root_info.get("nps"))
+        root_tablebase_hits = _to_optional_int(root_info.get("tbhits"))
+
+        if move_hints:
+            best_hint = move_hints[0]
+            if best_hint.centipawn_score is not None:
+                root_centipawn = best_hint.centipawn_score
+            if root_depth is None:
+                root_depth = best_hint.search_depth
+            if root_selective_depth is None:
+                root_selective_depth = best_hint.selective_depth
+            if root_nodes is None:
+                root_nodes = best_hint.nodes
+            if root_nps is None:
+                root_nps = best_hint.nps
+            if root_tablebase_hits is None:
+                root_tablebase_hits = best_hint.tablebase_hits
+
+        syzygy_root_wdl, syzygy_root_dtz = self._probe_syzygy(board)
+
         return PositionHintPack(
             fen=fen,
             side_to_move="w" if board.turn == chess.WHITE else "b",
             root_wdl=root_score,
             threat_summary=summarize_threats(board),
             candidate_moves=tuple(move_hints),
+            root_centipawn_score=root_centipawn,
+            root_search_depth=root_depth,
+            root_selective_depth=root_selective_depth,
+            root_nodes=root_nodes,
+            root_nps=root_nps,
+            root_tablebase_hits=root_tablebase_hits,
+            syzygy_root_wdl=syzygy_root_wdl,
+            syzygy_root_dtz=syzygy_root_dtz,
         )
 
     def analyze_and_render(
@@ -729,6 +973,7 @@ class StockfishHintExtractor:
     @staticmethod
     def _render_move_verification_feedback(verification: MoveVerification) -> str:
         cp_loss_text = f"{verification.cp_loss:.1f}"
+        cp_loss_source_text = verification.cp_loss_source
         best_cp_text = (
             f"{verification.best_centipawn:+.1f}"
             if verification.best_centipawn is not None
@@ -767,12 +1012,28 @@ class StockfishHintExtractor:
 
         lines.append(
             "- Centipawn scores (side to move): "
-            f"best={best_cp_text}, predicted={predicted_cp_text}, cp_loss={cp_loss_text}"
+            f"best={best_cp_text}, predicted={predicted_cp_text}, "
+            f"cp_loss={cp_loss_text} (source={cp_loss_source_text})"
         )
         lines.append(
             "- Expected score (WDL): "
             f"best={best_exp_text}, predicted={predicted_exp_text}"
         )
+        if verification.syzygy_root_wdl is not None:
+            root_syzygy_text = _syzygy_wdl_label(verification.syzygy_root_wdl)
+            if verification.syzygy_root_dtz is not None:
+                root_syzygy_text += f", DTZ={verification.syzygy_root_dtz}"
+            lines.append("- Syzygy root: " + root_syzygy_text)
+        if verification.syzygy_best_wdl is not None:
+            best_syzygy_text = _syzygy_wdl_label(verification.syzygy_best_wdl)
+            if verification.syzygy_best_dtz is not None:
+                best_syzygy_text += f", DTZ={verification.syzygy_best_dtz}"
+            lines.append("- Syzygy best move outcome: " + best_syzygy_text)
+        if verification.syzygy_predicted_wdl is not None:
+            predicted_syzygy_text = _syzygy_wdl_label(verification.syzygy_predicted_wdl)
+            if verification.syzygy_predicted_dtz is not None:
+                predicted_syzygy_text += f", DTZ={verification.syzygy_predicted_dtz}"
+            lines.append("- Syzygy predicted move outcome: " + predicted_syzygy_text)
 
         if verification.best_pv_san:
             lines.append("- Best PV: " + " ".join(verification.best_pv_san))
@@ -805,6 +1066,19 @@ class StockfishHintExtractor:
         best_cp = best_move.centipawn_score if best_move else None
         best_expected = best_move.expected_score if best_move else None
         best_pv = best_move.pv_san if best_move else ()
+        syzygy_root_wdl, syzygy_root_dtz = self._probe_syzygy(board)
+
+        syzygy_best_wdl: int | None = None
+        syzygy_best_dtz: int | None = None
+        if best_move is not None:
+            try:
+                best_move_obj = chess.Move.from_uci(best_move.uci)
+                if best_move_obj in board.legal_moves:
+                    best_board = board.copy(stack=False)
+                    best_board.push(best_move_obj)
+                    syzygy_best_wdl, syzygy_best_dtz = self._probe_syzygy(best_board)
+            except Exception:
+                syzygy_best_wdl, syzygy_best_dtz = None, None
 
         if predicted_move is None:
             verification = MoveVerification(
@@ -818,10 +1092,17 @@ class StockfishHintExtractor:
                 predicted_centipawn=None,
                 best_centipawn=best_cp,
                 cp_loss=float(illegal_move_cp_loss),
+                cp_loss_source="illegal_or_unparsed",
                 predicted_expected_score=None,
                 best_expected_score=best_expected,
                 predicted_pv_san=(),
                 best_pv_san=best_pv,
+                syzygy_root_wdl=syzygy_root_wdl,
+                syzygy_root_dtz=syzygy_root_dtz,
+                syzygy_predicted_wdl=None,
+                syzygy_predicted_dtz=None,
+                syzygy_best_wdl=syzygy_best_wdl,
+                syzygy_best_dtz=syzygy_best_dtz,
                 feedback_text="",
             )
             return replace(
@@ -856,12 +1137,19 @@ class StockfishHintExtractor:
             predicted_cp = predicted_hint.centipawn_score
             predicted_pv = predicted_hint.pv_san
 
-        if best_cp is not None and predicted_cp is not None:
-            cp_loss = max(0.0, float(best_cp - predicted_cp))
-        elif best_move_uci is not None and best_move_uci == predicted_move.uci():
-            cp_loss = 0.0
-        else:
-            cp_loss = 0.0
+        cp_loss, cp_loss_source = _compute_cp_loss(
+            best_cp=best_cp,
+            predicted_cp=predicted_cp,
+            best_expected_score=best_expected,
+            predicted_expected_score=predicted_expected,
+            best_move_uci=best_move_uci,
+            predicted_move_uci=predicted_move.uci(),
+            unknown_score_cp_loss=self.config.unknown_score_cp_loss,
+        )
+
+        predicted_board = board.copy(stack=False)
+        predicted_board.push(predicted_move)
+        syzygy_predicted_wdl, syzygy_predicted_dtz = self._probe_syzygy(predicted_board)
 
         verification = MoveVerification(
             fen=fen,
@@ -874,10 +1162,17 @@ class StockfishHintExtractor:
             predicted_centipawn=predicted_cp,
             best_centipawn=best_cp,
             cp_loss=cp_loss,
+            cp_loss_source=cp_loss_source,
             predicted_expected_score=predicted_expected,
             best_expected_score=best_expected,
             predicted_pv_san=predicted_pv,
             best_pv_san=best_pv,
+            syzygy_root_wdl=syzygy_root_wdl,
+            syzygy_root_dtz=syzygy_root_dtz,
+            syzygy_predicted_wdl=syzygy_predicted_wdl,
+            syzygy_predicted_dtz=syzygy_predicted_dtz,
+            syzygy_best_wdl=syzygy_best_wdl,
+            syzygy_best_dtz=syzygy_best_dtz,
             feedback_text="",
         )
         return replace(

@@ -507,6 +507,7 @@ def test_stockfish_hint_metrics(monkeypatch):
             return SimpleNamespace(
                 move_is_legal=True,
                 cp_loss=42.0,
+                cp_loss_source="centipawn",
                 feedback_text="Stockfish says this move loses 42 cp to best.",
             )
 

@@ -75,8 +75,12 @@ class CLIConfig:
     stockfish_hint_bad_move_threshold: float = 0.05
     stockfish_include_fen_decode: bool = True
     stockfish_include_ascii_board: bool = True
+    stockfish_include_search_stats: bool = True
     stockfish_max_piece_pressure_items: int = 8
     stockfish_max_weak_square_items: int = 8
+    stockfish_syzygy_path: str | None = None
+    stockfish_syzygy_max_pieces: int = 7
+    stockfish_unknown_score_cp_loss: float = 80.0
     stockfish_hints_template: str = (
         "\nStockfish position hints (WDL expected score):\n\n{stockfish_hints}\n\n"
     )
@@ -173,8 +177,12 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
         stockfish_hint_bad_move_threshold=cli_config.stockfish_hint_bad_move_threshold,
         stockfish_include_fen_decode=cli_config.stockfish_include_fen_decode,
         stockfish_include_ascii_board=cli_config.stockfish_include_ascii_board,
+        stockfish_include_search_stats=cli_config.stockfish_include_search_stats,
         stockfish_max_piece_pressure_items=cli_config.stockfish_max_piece_pressure_items,
         stockfish_max_weak_square_items=cli_config.stockfish_max_weak_square_items,
+        stockfish_syzygy_path=cli_config.stockfish_syzygy_path,
+        stockfish_syzygy_max_pieces=cli_config.stockfish_syzygy_max_pieces,
+        stockfish_unknown_score_cp_loss=cli_config.stockfish_unknown_score_cp_loss,
         stockfish_hints_template=cli_config.stockfish_hints_template,
         stockfish_hints_only_without_solution=cli_config.stockfish_hints_only_without_solution,
         stockfish_verification_depth=cli_config.stockfish_verification_depth,

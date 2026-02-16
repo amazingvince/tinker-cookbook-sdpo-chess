@@ -69,6 +69,7 @@ Expected SDPO metrics in `metrics.jsonl`:
 - `sdpo/stockfish_legal_move_fraction`
 - `sdpo/stockfish_feedback_fraction`
 - `sdpo/stockfish_avg_cp_loss`
+- `sdpo/stockfish_estimated_cp_loss_fraction`
 
 ### Chess + Stockfish Hints
 
@@ -88,18 +89,22 @@ python -m tinker_cookbook.recipes.verifiers_rl.sdpo_train \
   stockfish_feedback_cp_loss_threshold=20 \
   stockfish_include_fen_decode=true \
   stockfish_include_ascii_board=true \
+  stockfish_include_search_stats=true \
+  stockfish_syzygy_path=/path/to/syzygy \
   stockfish_wdl_model=sf
 ```
 
 If enabled, teacher reprompts can include:
 - root WDL expected score (`E = p(win) + 0.5 * p(draw)`);
+- root search stats (depth/seldepth/nodes/nps/tbhits when available);
+- optional Syzygy tablebase root outcome/DTZ for <= `stockfish_syzygy_max_pieces`;
 - top candidate moves with `delta_E` vs the best line;
 - threat summaries (hanging pieces, threatened pieces, checking opportunities);
 - FEN-decoded board context (material, king squares, pieces under pressure, weak king-zone squares);
 - "moves likely to be bad" explanations with refutation context when available.
 - detailed Stockfish move-verification feedback including:
   - model predicted move vs Stockfish best move at depth 20;
-  - centipawn loss (`cp_loss = cp_best - cp_predicted`, clipped at 0);
+  - cp-loss with source (`centipawn`, `wdl_scaled`, or fallback penalty if score is unavailable);
   - best and predicted PV lines for concrete guidance.
 
 To create a starter JSONL dataset of random FENs from Lichess puzzles + games:
