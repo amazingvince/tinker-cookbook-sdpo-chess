@@ -65,6 +65,10 @@ class GroupSdpoStats:
     feedback_used_samples: int = 0
     stockfish_hint_available_samples: int = 0
     stockfish_hint_used_samples: int = 0
+    stockfish_verified_samples: int = 0
+    stockfish_legal_move_samples: int = 0
+    stockfish_cp_loss_sum: float = 0.0
+    stockfish_feedback_samples: int = 0
     reprompt_samples: int = 0
     zero_adv_samples: int = 0
     skipped_samples: int = 0
@@ -134,6 +138,10 @@ class Config:
         "\nStockfish position hints (WDL expected score):\n\n{stockfish_hints}\n\n"
     )
     stockfish_hints_only_without_solution: bool = False
+    stockfish_verification_depth: int = 20
+    stockfish_illegal_move_cp_loss: float = 1000.0
+    include_stockfish_move_feedback: bool = True
+    stockfish_feedback_cp_loss_threshold: float = 0.0
     max_reprompt_tokens: int = 10240
     reprompt_truncation: Literal["left", "right", "error"] = "right"
     strict_single_turn: bool = True
@@ -748,7 +756,9 @@ async def build_group_sdpo_datums(
 
     stockfish_hints_by_fen: dict[str, str] = {}
     datum_tasks: list[
-        asyncio.Task[tuple[tinker.Datum, list[float], bool, bool, bool, int, int]]
+        asyncio.Task[
+            tuple[tinker.Datum, list[float], bool, bool, bool, bool, bool, float, int, int]
+        ]
     ] = []
 
     for i, sample in enumerate(records):
@@ -789,10 +799,49 @@ async def build_group_sdpo_datums(
             and (not config.stockfish_hints_only_without_solution or not bool(solution_text))
         )
 
+        combined_feedback_text = sample.feedback_text
+        stockfish_verified = False
+        stockfish_move_is_legal = False
+        stockfish_cp_loss = 0.0
+        stockfish_feedback_used = False
+        if (
+            config.enable_stockfish_hints
+            and stockfish_hint_extractor is not None
+            and sample.fen is not None
+        ):
+            try:
+                verification = stockfish_hint_extractor.verify_predicted_move(
+                    fen=sample.fen,
+                    predicted_text=sample.response_text,
+                    depth=config.stockfish_verification_depth,
+                    illegal_move_cp_loss=config.stockfish_illegal_move_cp_loss,
+                )
+                stockfish_verified = True
+                stockfish_move_is_legal = verification.move_is_legal
+                stockfish_cp_loss = float(verification.cp_loss)
+                should_add_stockfish_feedback = (
+                    config.include_stockfish_move_feedback
+                    and stockfish_cp_loss >= config.stockfish_feedback_cp_loss_threshold
+                )
+                if should_add_stockfish_feedback:
+                    if combined_feedback_text:
+                        combined_feedback_text = (
+                            f"{combined_feedback_text}\n\n{verification.feedback_text}"
+                        )
+                    else:
+                        combined_feedback_text = verification.feedback_text
+                    stockfish_feedback_used = True
+            except Exception as exc:
+                logger.warning(
+                    "Failed Stockfish move verification for FEN %s: %s",
+                    sample.fen,
+                    exc,
+                )
+
         teacher_messages, feedback_used, used_reprompt = build_teacher_messages(
             prompt_messages=sample.prompt_messages,
             solution_text=solution_text,
-            feedback_text=sample.feedback_text,
+            feedback_text=combined_feedback_text,
             reprompt_template=config.reprompt_template,
             solution_template=config.solution_template,
             feedback_template=config.feedback_template,
@@ -811,7 +860,11 @@ async def build_group_sdpo_datums(
             local_feedback_used: bool = feedback_used,
             local_used_reprompt: bool = used_reprompt,
             local_stockfish_hint_used: bool = stockfish_hint_used,
-        ) -> tuple[tinker.Datum, list[float], bool, bool, bool, int, int]:
+            local_stockfish_verified: bool = stockfish_verified,
+            local_stockfish_move_is_legal: bool = stockfish_move_is_legal,
+            local_stockfish_cp_loss: float = stockfish_cp_loss,
+            local_stockfish_feedback_used: bool = stockfish_feedback_used,
+        ) -> tuple[tinker.Datum, list[float], bool, bool, bool, bool, bool, float, int, int]:
             advantages, topk_overlap_count, topk_total_count = await _compute_sample_advantages(
                 sample=rollout_sample,
                 teacher_messages=local_teacher_messages,
@@ -849,6 +902,10 @@ async def build_group_sdpo_datums(
                 local_feedback_used,
                 local_used_reprompt,
                 local_stockfish_hint_used,
+                local_stockfish_verified,
+                local_stockfish_move_is_legal,
+                local_stockfish_cp_loss,
+                local_stockfish_feedback_used,
                 topk_overlap_count,
                 topk_total_count,
             )
@@ -863,6 +920,10 @@ async def build_group_sdpo_datums(
             feedback_used,
             used_reprompt,
             stockfish_hint_used,
+            stockfish_verified,
+            stockfish_move_is_legal,
+            stockfish_cp_loss,
+            stockfish_feedback_used,
             topk_overlap_count,
             topk_total_count,
         ) = await task
@@ -872,6 +933,13 @@ async def build_group_sdpo_datums(
             stats.feedback_used_samples += 1
         if stockfish_hint_used:
             stats.stockfish_hint_used_samples += 1
+        if stockfish_verified:
+            stats.stockfish_verified_samples += 1
+            stats.stockfish_cp_loss_sum += stockfish_cp_loss
+        if stockfish_move_is_legal:
+            stats.stockfish_legal_move_samples += 1
+        if stockfish_feedback_used:
+            stats.stockfish_feedback_samples += 1
         if used_reprompt:
             stats.reprompt_samples += 1
         if all(abs(v) < 1e-12 for v in advantages):
@@ -951,6 +1019,10 @@ async def run_sdpo_batch_update(
         total_stats.feedback_used_samples += group_stats.feedback_used_samples
         total_stats.stockfish_hint_available_samples += group_stats.stockfish_hint_available_samples
         total_stats.stockfish_hint_used_samples += group_stats.stockfish_hint_used_samples
+        total_stats.stockfish_verified_samples += group_stats.stockfish_verified_samples
+        total_stats.stockfish_legal_move_samples += group_stats.stockfish_legal_move_samples
+        total_stats.stockfish_cp_loss_sum += group_stats.stockfish_cp_loss_sum
+        total_stats.stockfish_feedback_samples += group_stats.stockfish_feedback_samples
         total_stats.reprompt_samples += group_stats.reprompt_samples
         total_stats.zero_adv_samples += group_stats.zero_adv_samples
         total_stats.skipped_samples += group_stats.skipped_samples
@@ -969,6 +1041,7 @@ async def run_sdpo_batch_update(
         "sdpo/full_logit_distillation": float(config.full_logit_distillation),
         "sdpo/updates_per_batch": float(config.updates_per_batch),
         "sdpo/stockfish_hints_enabled": float(config.enable_stockfish_hints),
+        "sdpo/stockfish_verification_depth": float(config.stockfish_verification_depth),
     }
 
     if len(states_by_group) > 0:
@@ -990,6 +1063,15 @@ async def run_sdpo_batch_update(
         metrics["sdpo/stockfish_hint_used_fraction"] = (
             total_stats.stockfish_hint_used_samples / total_stats.num_samples
         )
+        metrics["sdpo/stockfish_verified_fraction"] = (
+            total_stats.stockfish_verified_samples / total_stats.num_samples
+        )
+        metrics["sdpo/stockfish_legal_move_fraction"] = (
+            total_stats.stockfish_legal_move_samples / total_stats.num_samples
+        )
+        metrics["sdpo/stockfish_feedback_fraction"] = (
+            total_stats.stockfish_feedback_samples / total_stats.num_samples
+        )
         metrics["sdpo/reprompt_sample_fraction"] = total_stats.reprompt_samples / total_stats.num_samples
     else:
         metrics["sdpo/success_sample_fraction"] = 0.0
@@ -997,9 +1079,18 @@ async def run_sdpo_batch_update(
         metrics["sdpo/feedback_used_fraction"] = 0.0
         metrics["sdpo/stockfish_hint_available_fraction"] = 0.0
         metrics["sdpo/stockfish_hint_used_fraction"] = 0.0
+        metrics["sdpo/stockfish_verified_fraction"] = 0.0
+        metrics["sdpo/stockfish_legal_move_fraction"] = 0.0
+        metrics["sdpo/stockfish_feedback_fraction"] = 0.0
         metrics["sdpo/reprompt_sample_fraction"] = 0.0
 
     metrics["sdpo/num_zero_adv_samples"] = total_stats.zero_adv_samples
+    if total_stats.stockfish_verified_samples > 0:
+        metrics["sdpo/stockfish_avg_cp_loss"] = (
+            total_stats.stockfish_cp_loss_sum / total_stats.stockfish_verified_samples
+        )
+    else:
+        metrics["sdpo/stockfish_avg_cp_loss"] = 0.0
 
     if total_stats.advantage_count > 0:
         metrics["sdpo/mean_advantage"] = total_stats.advantage_sum / total_stats.advantage_count

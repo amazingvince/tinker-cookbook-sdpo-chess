@@ -62,8 +62,13 @@ Expected SDPO metrics in `metrics.jsonl`:
 - `sdpo/topk_overlap_fraction`
 - `sdpo/updates_per_batch`
 - `sdpo/stockfish_hints_enabled`
+- `sdpo/stockfish_verification_depth`
 - `sdpo/stockfish_hint_available_fraction`
 - `sdpo/stockfish_hint_used_fraction`
+- `sdpo/stockfish_verified_fraction`
+- `sdpo/stockfish_legal_move_fraction`
+- `sdpo/stockfish_feedback_fraction`
+- `sdpo/stockfish_avg_cp_loss`
 
 ### Chess + Stockfish Hints
 
@@ -78,6 +83,9 @@ python -m tinker_cookbook.recipes.verifiers_rl.sdpo_train \
   stockfish_path=/path/to/stockfish \
   stockfish_depth=14 \
   stockfish_multipv=5 \
+  stockfish_verification_depth=20 \
+  include_stockfish_move_feedback=true \
+  stockfish_feedback_cp_loss_threshold=20 \
   stockfish_wdl_model=sf
 ```
 
@@ -86,6 +94,10 @@ If enabled, teacher reprompts can include:
 - top candidate moves with `delta_E` vs the best line;
 - threat summaries (hanging pieces, threatened pieces, checking opportunities);
 - "moves likely to be bad" explanations with refutation context when available.
+- detailed Stockfish move-verification feedback including:
+  - model predicted move vs Stockfish best move at depth 20;
+  - centipawn loss (`cp_loss = cp_best - cp_predicted`, clipped at 0);
+  - best and predicted PV lines for concrete guidance.
 
 To create a starter JSONL dataset of random FENs from Lichess puzzles + games:
 

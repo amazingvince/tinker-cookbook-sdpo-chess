@@ -20,6 +20,8 @@ logger = logging.getLogger(__name__)
 _FEN_RE = re.compile(
     r"((?:[pnbrqkPNBRQK1-8]{1,8}/){7}[pnbrqkPNBRQK1-8]{1,8}\s[wb]\s(?:-|[KQkq]{1,4})\s(?:-|[a-h][36])\s\d+\s\d+)"
 )
+_UCI_MOVE_RE = re.compile(r"\b([a-h][1-8][a-h][1-8][qrbn]?)\b", flags=re.IGNORECASE)
+
 
 @dataclass(frozen=True)
 class WdlStats:
@@ -50,6 +52,7 @@ class MoveHint:
     gives_check: bool
     is_promotion: bool
     hangs_moved_piece: bool
+    centipawn_score: float | None = None
 
 
 @dataclass(frozen=True)
@@ -73,6 +76,25 @@ class StockfishHintConfig:
     max_good_moves: int = 3
     max_bad_moves: int = 3
     bad_move_threshold: float = 0.05
+
+
+@dataclass(frozen=True)
+class MoveVerification:
+    fen: str
+    depth: int
+    predicted_move_uci: str | None
+    predicted_move_san: str | None
+    move_is_legal: bool
+    best_move_uci: str | None
+    best_move_san: str | None
+    predicted_centipawn: float | None
+    best_centipawn: float | None
+    cp_loss: float
+    predicted_expected_score: float | None
+    best_expected_score: float | None
+    predicted_pv_san: tuple[str, ...]
+    best_pv_san: tuple[str, ...]
+    feedback_text: str
 
 
 def wdl_to_stats(wins: int, draws: int, losses: int) -> WdlStats:
@@ -216,6 +238,50 @@ def _score_to_wdl_stats(score: Any, board: Any, wdl_model: str) -> WdlStats:
     return wdl_to_stats(int(wdl.wins), int(wdl.draws), int(wdl.losses))
 
 
+def _score_to_centipawn(score: Any, board: Any, mate_score: int = 10000) -> float | None:
+    if chess is None:
+        raise RuntimeError("python-chess is required for Stockfish hint extraction")
+    if score is None:
+        return None
+
+    if isinstance(score, chess.engine.PovScore):
+        pov_score = score.pov(board.turn)
+    else:
+        pov_score = score
+
+    centipawn = pov_score.score(mate_score=mate_score)
+    if centipawn is None:
+        return None
+    return float(centipawn)
+
+
+def extract_predicted_move(board: Any, predicted_text: str) -> Any | None:
+    if chess is None:
+        raise RuntimeError("python-chess is required for Stockfish hint extraction")
+
+    for match in _UCI_MOVE_RE.finditer(predicted_text.lower()):
+        candidate = match.group(1)
+        try:
+            move = chess.Move.from_uci(candidate)
+        except ValueError:
+            continue
+        if move in board.legal_moves:
+            return move
+
+    for raw in predicted_text.split():
+        candidate = raw.strip().strip("`\"'.,;:!?()[]{}")
+        if not candidate:
+            continue
+        try:
+            move = board.parse_san(candidate)
+        except Exception:
+            continue
+        if move in board.legal_moves:
+            return move
+
+    return None
+
+
 def _move_hangs_piece(board: Any, move: Any) -> bool:
     moved_board = board.copy(stack=False)
     moved_board.push(move)
@@ -250,6 +316,7 @@ def _extract_move_hint_from_info(
         return None
 
     move_score = _score_to_wdl_stats(info.get("score"), board, config.wdl_model)
+    centipawn_score = _score_to_centipawn(info.get("score"), board)
     pv_san = _pv_to_san(board, pv, config.max_pv_plies)
 
     return MoveHint(
@@ -257,6 +324,7 @@ def _extract_move_hint_from_info(
         san=board.san(move),
         expected_score=move_score.expected_score,
         delta_expected_score=0.0,
+        centipawn_score=centipawn_score,
         pv_san=pv_san,
         refutation_san=pv_san[1] if len(pv_san) > 1 else None,
         is_capture=board.is_capture(move),
@@ -296,9 +364,10 @@ def render_hint_text(pack: PositionHintPack, config: StockfishHintConfig) -> str
         lines.append("Top candidate moves by expected score:")
     for move in pack.candidate_moves[: config.max_good_moves]:
         pv_text = " ".join(move.pv_san) if move.pv_san else "(no pv)"
+        cp_text = f"{move.centipawn_score:+.1f}" if move.centipawn_score is not None else "n/a"
         lines.append(
             f"- {move.uci} ({move.san}): E={move.expected_score:.3f}, "
-            f"delta_E={move.delta_expected_score:+.3f}, pv={pv_text}"
+            f"delta_E={move.delta_expected_score:+.3f}, cp={cp_text}, pv={pv_text}"
         )
 
     bad_moves = [
@@ -337,6 +406,8 @@ class StockfishHintExtractor:
             )
         self.config = config
         self._engine = chess.engine.SimpleEngine.popen_uci(config.stockfish_path)
+        self._root_analysis_cache: dict[tuple[str, int, int], list[Mapping[str, Any]]] = {}
+        self._move_analysis_cache: dict[tuple[str, int, str], Mapping[str, Any]] = {}
         self._configure_engine()
 
     def _configure_engine(self) -> None:
@@ -356,20 +427,60 @@ class StockfishHintExtractor:
     def close(self) -> None:
         self._engine.quit()
 
-    def analyze_fen(self, fen: str) -> PositionHintPack:
+    @staticmethod
+    def _normalize_infos(raw_infos: Any) -> list[Mapping[str, Any]]:
+        if isinstance(raw_infos, Mapping):
+            return [raw_infos]
+        if isinstance(raw_infos, list):
+            return [info for info in raw_infos if isinstance(info, Mapping)]
+        return []
+
+    def _analyze_root_infos(self, board: Any, depth: int, multipv: int) -> list[Mapping[str, Any]]:
+        cache_key = (board.fen(), depth, multipv)
+        cached = self._root_analysis_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        raw_infos = self._engine.analyse(
+            board,
+            limit=chess.engine.Limit(depth=depth),
+            multipv=max(1, multipv),
+        )
+        infos = self._normalize_infos(raw_infos)
+        self._root_analysis_cache[cache_key] = infos
+        return infos
+
+    def _analyze_move_info(self, board: Any, move: Any, depth: int) -> Mapping[str, Any] | None:
+        cache_key = (board.fen(), depth, move.uci())
+        cached = self._move_analysis_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        raw_info = self._engine.analyse(
+            board,
+            limit=chess.engine.Limit(depth=depth),
+            multipv=1,
+            root_moves=[move],
+        )
+        infos = self._normalize_infos(raw_info)
+        if not infos:
+            return None
+        info = infos[0]
+        self._move_analysis_cache[cache_key] = info
+        return info
+
+    def analyze_fen(
+        self,
+        fen: str,
+        depth: int | None = None,
+        multipv: int | None = None,
+    ) -> PositionHintPack:
         if chess is None:
             raise RuntimeError("python-chess is required for Stockfish hint extraction")
         board = chess.Board(fen)
-        limit = chess.engine.Limit(depth=self.config.depth)
-        raw_infos = self._engine.analyse(
-            board,
-            limit=limit,
-            multipv=max(1, self.config.multipv),
-        )
-        if isinstance(raw_infos, Mapping):
-            infos = [raw_infos]
-        else:
-            infos = [info for info in raw_infos if isinstance(info, Mapping)]
+        analysis_depth = depth if depth is not None else self.config.depth
+        analysis_multipv = multipv if multipv is not None else self.config.multipv
+        infos = self._analyze_root_infos(board, depth=analysis_depth, multipv=max(1, analysis_multipv))
 
         move_hints: list[MoveHint] = []
         for info in infos:
@@ -401,8 +512,179 @@ class StockfishHintExtractor:
             candidate_moves=tuple(move_hints),
         )
 
-    def analyze_and_render(self, fen: str) -> str:
-        return render_hint_text(self.analyze_fen(fen), self.config)
+    def analyze_and_render(
+        self,
+        fen: str,
+        depth: int | None = None,
+        multipv: int | None = None,
+    ) -> str:
+        return render_hint_text(
+            self.analyze_fen(
+                fen=fen,
+                depth=depth,
+                multipv=multipv,
+            ),
+            self.config,
+        )
+
+    @staticmethod
+    def _render_move_verification_feedback(verification: MoveVerification) -> str:
+        cp_loss_text = f"{verification.cp_loss:.1f}"
+        best_cp_text = (
+            f"{verification.best_centipawn:+.1f}"
+            if verification.best_centipawn is not None
+            else "n/a"
+        )
+        predicted_cp_text = (
+            f"{verification.predicted_centipawn:+.1f}"
+            if verification.predicted_centipawn is not None
+            else "n/a"
+        )
+        best_exp_text = (
+            f"{verification.best_expected_score:.3f}"
+            if verification.best_expected_score is not None
+            else "n/a"
+        )
+        predicted_exp_text = (
+            f"{verification.predicted_expected_score:.3f}"
+            if verification.predicted_expected_score is not None
+            else "n/a"
+        )
+
+        lines = ["Stockfish move verification:"]
+        if verification.move_is_legal:
+            predicted_desc = verification.predicted_move_uci or "n/a"
+            if verification.predicted_move_san:
+                predicted_desc += f" ({verification.predicted_move_san})"
+            lines.append(f"- Predicted move: {predicted_desc}")
+        else:
+            lines.append("- Predicted move could not be parsed as a legal move from this FEN.")
+
+        if verification.best_move_uci:
+            best_desc = verification.best_move_uci
+            if verification.best_move_san:
+                best_desc += f" ({verification.best_move_san})"
+            lines.append(f"- Stockfish best move at depth {verification.depth}: {best_desc}")
+
+        lines.append(
+            "- Centipawn scores (side to move): "
+            f"best={best_cp_text}, predicted={predicted_cp_text}, cp_loss={cp_loss_text}"
+        )
+        lines.append(
+            "- Expected score (WDL): "
+            f"best={best_exp_text}, predicted={predicted_exp_text}"
+        )
+
+        if verification.best_pv_san:
+            lines.append("- Best PV: " + " ".join(verification.best_pv_san))
+        if verification.predicted_pv_san:
+            lines.append("- Predicted-move PV: " + " ".join(verification.predicted_pv_san))
+
+        return "\n".join(lines).strip()
+
+    def verify_predicted_move(
+        self,
+        fen: str,
+        predicted_text: str,
+        depth: int = 20,
+        illegal_move_cp_loss: float = 1000.0,
+    ) -> MoveVerification:
+        if chess is None:
+            raise RuntimeError("python-chess is required for Stockfish hint extraction")
+
+        board = chess.Board(fen)
+        pack = self.analyze_fen(
+            fen=fen,
+            depth=depth,
+            multipv=max(self.config.multipv, 8),
+        )
+        best_move = pack.candidate_moves[0] if pack.candidate_moves else None
+        predicted_move = extract_predicted_move(board, predicted_text)
+
+        best_move_uci = best_move.uci if best_move else None
+        best_move_san = best_move.san if best_move else None
+        best_cp = best_move.centipawn_score if best_move else None
+        best_expected = best_move.expected_score if best_move else None
+        best_pv = best_move.pv_san if best_move else ()
+
+        if predicted_move is None:
+            verification = MoveVerification(
+                fen=fen,
+                depth=depth,
+                predicted_move_uci=None,
+                predicted_move_san=None,
+                move_is_legal=False,
+                best_move_uci=best_move_uci,
+                best_move_san=best_move_san,
+                predicted_centipawn=None,
+                best_centipawn=best_cp,
+                cp_loss=float(illegal_move_cp_loss),
+                predicted_expected_score=None,
+                best_expected_score=best_expected,
+                predicted_pv_san=(),
+                best_pv_san=best_pv,
+                feedback_text="",
+            )
+            return replace(
+                verification,
+                feedback_text=self._render_move_verification_feedback(verification),
+            )
+
+        predicted_san = board.san(predicted_move)
+        predicted_hint = next(
+            (move_hint for move_hint in pack.candidate_moves if move_hint.uci == predicted_move.uci()),
+            None,
+        )
+
+        if predicted_hint is None:
+            predicted_info = self._analyze_move_info(board, predicted_move, depth=depth)
+            predicted_expected = (
+                _score_to_wdl_stats(predicted_info.get("score"), board, self.config.wdl_model).expected_score
+                if predicted_info is not None
+                else None
+            )
+            predicted_cp = (
+                _score_to_centipawn(predicted_info.get("score"), board)
+                if predicted_info is not None
+                else None
+            )
+            if predicted_info is not None and isinstance(predicted_info.get("pv"), list):
+                predicted_pv = _pv_to_san(board, predicted_info["pv"], self.config.max_pv_plies)
+            else:
+                predicted_pv = (predicted_san,)
+        else:
+            predicted_expected = predicted_hint.expected_score
+            predicted_cp = predicted_hint.centipawn_score
+            predicted_pv = predicted_hint.pv_san
+
+        if best_cp is not None and predicted_cp is not None:
+            cp_loss = max(0.0, float(best_cp - predicted_cp))
+        elif best_move_uci is not None and best_move_uci == predicted_move.uci():
+            cp_loss = 0.0
+        else:
+            cp_loss = 0.0
+
+        verification = MoveVerification(
+            fen=fen,
+            depth=depth,
+            predicted_move_uci=predicted_move.uci(),
+            predicted_move_san=predicted_san,
+            move_is_legal=True,
+            best_move_uci=best_move_uci,
+            best_move_san=best_move_san,
+            predicted_centipawn=predicted_cp,
+            best_centipawn=best_cp,
+            cp_loss=cp_loss,
+            predicted_expected_score=predicted_expected,
+            best_expected_score=best_expected,
+            predicted_pv_san=predicted_pv,
+            best_pv_san=best_pv,
+            feedback_text="",
+        )
+        return replace(
+            verification,
+            feedback_text=self._render_move_verification_feedback(verification),
+        )
 
 
 def pick_random_game_fen(movetext: str, seed: int | None = None) -> str | None:
@@ -445,6 +727,7 @@ def build_stockfish_hint_text_for_state(
 
 
 __all__ = [
+    "MoveVerification",
     "MoveHint",
     "PositionHintPack",
     "StockfishHintConfig",
@@ -452,6 +735,7 @@ __all__ = [
     "ThreatSummary",
     "WdlStats",
     "build_stockfish_hint_text_for_state",
+    "extract_predicted_move",
     "extract_fen_from_state",
     "extract_fen_from_text",
     "render_hint_text",

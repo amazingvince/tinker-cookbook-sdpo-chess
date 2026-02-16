@@ -14,6 +14,7 @@ from tinker_cookbook.sdpo.chess_hints import (  # noqa: E402
     build_stockfish_hint_text_for_state,
     extract_fen_from_state,
     extract_fen_from_text,
+    extract_predicted_move,
     pick_random_game_fen,
     render_hint_text,
     summarize_threats,
@@ -69,6 +70,7 @@ def test_render_hint_text_includes_good_and_bad_move_sections():
                 san="Ka2",
                 expected_score=0.61,
                 delta_expected_score=0.0,
+                centipawn_score=35.0,
                 pv_san=("Ka2", "Kh2"),
                 refutation_san="Kh2",
                 is_capture=False,
@@ -81,6 +83,7 @@ def test_render_hint_text_includes_good_and_bad_move_sections():
                 san="Kb1",
                 expected_score=0.48,
                 delta_expected_score=0.13,
+                centipawn_score=-12.0,
                 pv_san=("Kb1", "Kh2"),
                 refutation_san="Kh2",
                 is_capture=False,
@@ -97,7 +100,19 @@ def test_render_hint_text_includes_good_and_bad_move_sections():
     assert "Root expected score (WDL)" in text
     assert "Top candidate moves by expected score:" in text
     assert "Moves likely to be bad:" in text
+    assert "cp=+35.0" in text
     assert "hangs moved piece" in text
+
+
+def test_extract_predicted_move_from_uci_and_san():
+    board = chess.Board()
+    from_uci = extract_predicted_move(board, "My move is e2e4.")
+    assert from_uci is not None
+    assert from_uci.uci() == "e2e4"
+
+    from_san = extract_predicted_move(board, "I choose Nf3 here.")
+    assert from_san is not None
+    assert from_san.uci() == "g1f3"
 
 
 def test_pick_random_game_fen_returns_valid_fen():

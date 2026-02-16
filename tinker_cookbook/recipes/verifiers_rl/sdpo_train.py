@@ -77,6 +77,10 @@ class CLIConfig:
         "\nStockfish position hints (WDL expected score):\n\n{stockfish_hints}\n\n"
     )
     stockfish_hints_only_without_solution: bool = False
+    stockfish_verification_depth: int = 20
+    stockfish_illegal_move_cp_loss: float = 1000.0
+    include_stockfish_move_feedback: bool = True
+    stockfish_feedback_cp_loss_threshold: float = 0.0
     max_reprompt_tokens: int = 10240
     reprompt_truncation: Literal["left", "right", "error"] = "right"
     strict_single_turn: bool = True
@@ -165,6 +169,10 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
         stockfish_hint_bad_move_threshold=cli_config.stockfish_hint_bad_move_threshold,
         stockfish_hints_template=cli_config.stockfish_hints_template,
         stockfish_hints_only_without_solution=cli_config.stockfish_hints_only_without_solution,
+        stockfish_verification_depth=cli_config.stockfish_verification_depth,
+        stockfish_illegal_move_cp_loss=cli_config.stockfish_illegal_move_cp_loss,
+        include_stockfish_move_feedback=cli_config.include_stockfish_move_feedback,
+        stockfish_feedback_cp_loss_threshold=cli_config.stockfish_feedback_cp_loss_threshold,
         max_reprompt_tokens=cli_config.max_reprompt_tokens,
         reprompt_truncation=cli_config.reprompt_truncation,
         strict_single_turn=cli_config.strict_single_turn,

@@ -473,6 +473,8 @@ def test_run_sdpo_batch_update_mocked_path(monkeypatch):
         assert metrics["sdpo/stockfish_hints_enabled"] == 0.0
         assert metrics["sdpo/stockfish_hint_available_fraction"] == 0.0
         assert metrics["sdpo/stockfish_hint_used_fraction"] == 0.0
+        assert metrics["sdpo/stockfish_verified_fraction"] == 0.0
+        assert metrics["sdpo/stockfish_avg_cp_loss"] == 0.0
         assert metrics["sdpo/reprompt_sample_fraction"] == 0.5
         assert metrics["sdpo/num_zero_adv_samples"] == 1
         assert metrics["sdpo/num_skipped_samples"] == 0
@@ -493,6 +495,20 @@ def test_stockfish_hint_metrics(monkeypatch):
     class _FakeStockfishHintExtractor:
         def analyze_and_render(self, fen: str) -> str:
             return f"hints for {fen}"
+
+        def verify_predicted_move(
+            self,
+            fen: str,
+            predicted_text: str,
+            depth: int = 20,
+            illegal_move_cp_loss: float = 1000.0,
+        ) -> Any:
+            _ = (fen, predicted_text, depth, illegal_move_cp_loss)
+            return SimpleNamespace(
+                move_is_legal=True,
+                cp_loss=42.0,
+                feedback_text="Stockfish says this move loses 42 cp to best.",
+            )
 
     async def fake_train_step(
         data_D: list[sdpo_train.tinker.Datum],
@@ -521,6 +537,7 @@ def test_stockfish_hint_metrics(monkeypatch):
             teacher_regularization="none",
             enable_stockfish_hints=True,
             reprompt_template="{prompt}{solution}{feedback}{hints}",
+            stockfish_feedback_cp_loss_threshold=10.0,
         )
         state = _make_state(
             prompt_messages=[
@@ -552,6 +569,9 @@ def test_stockfish_hint_metrics(monkeypatch):
         assert metrics["sdpo/stockfish_hints_enabled"] == 1.0
         assert metrics["sdpo/stockfish_hint_available_fraction"] == 1.0
         assert metrics["sdpo/stockfish_hint_used_fraction"] == 1.0
+        assert metrics["sdpo/stockfish_verified_fraction"] == 1.0
+        assert metrics["sdpo/stockfish_avg_cp_loss"] == 42.0
+        assert metrics["sdpo/stockfish_feedback_fraction"] == 1.0
 
     asyncio.run(_inner())
 
