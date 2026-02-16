@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import math
 import os
@@ -54,6 +55,7 @@ class RolloutSample:
     completion_logprobs: list[float]
     reward: float
     feedback_text: str | None
+    expected_answer: str | None
     response_text: str
 
 
@@ -103,6 +105,10 @@ class Config:
     ttl_seconds: int | None = 604800
     wandb_project: str | None = None
     wandb_name: str | None = None
+    debug_examples_every_n_steps: int = 0
+    debug_examples_per_step: int = 2
+    debug_examples_max_text_chars: int = 4000
+    debug_examples_file_name: str = "sdpo_debug_examples.jsonl"
 
     # verifiers rollout
     group_size: int = 8
@@ -238,6 +244,131 @@ def _normalize_prompt_messages(prompt_value: Any) -> list[renderers.Message]:
     raise ValueError("Unable to extract prompt messages from verifiers state")
 
 
+def _coerce_text(value: Any) -> str | None:
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped if stripped else None
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        parts = [_coerce_text(item) for item in value]
+        joined = "\n".join(part for part in parts if part)
+        return joined if joined else None
+    if isinstance(value, Mapping):
+        for key in ("answer", "expected_answer", "text", "content", "value", "move", "uci"):
+            nested = _coerce_text(value.get(key))
+            if nested:
+                return nested
+    return None
+
+
+def _extract_expected_answer_text(state: Mapping[str, Any]) -> str | None:
+    answer_keys = [
+        "expected_answer",
+        "answer",
+        "target_answer",
+        "ground_truth_answer",
+        "ground_truth",
+        "reference_answer",
+        "label",
+        "solution",
+    ]
+
+    for key in answer_keys:
+        value = _coerce_text(state.get(key))
+        if value:
+            return value
+
+    for container_key in ("rollout_input", "info", "metadata", "extra_info", "reward_extra_info"):
+        container = state.get(container_key)
+        if not isinstance(container, Mapping):
+            continue
+        for key in answer_keys:
+            value = _coerce_text(container.get(key))
+            if value:
+                return value
+
+    for container_key in ("info", "metadata", "extra_info", "reward_extra_info"):
+        container = state.get(container_key)
+        if not isinstance(container, Mapping):
+            continue
+        stockfish_best = _coerce_text(container.get("stockfish_best_move"))
+        if stockfish_best:
+            return stockfish_best
+
+    return None
+
+
+def _prompt_messages_to_text(prompt_messages: Sequence[renderers.Message]) -> str:
+    chunks: list[str] = []
+    for message in prompt_messages:
+        role = str(message.get("role", "unknown")).strip() or "unknown"
+        content = renderers.format_content_as_string(message.get("content", ""))
+        if content:
+            chunks.append(f"{role}: {content}")
+    return "\n\n".join(chunks)
+
+
+def _truncate_debug_text(text: str | None, max_chars: int) -> str | None:
+    if text is None:
+        return None
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars]}\n...[truncated {len(text) - max_chars} chars]"
+
+
+def _format_debug_examples_long_text(
+    batch_index: int,
+    debug_examples: Sequence[Mapping[str, Any]],
+) -> str:
+    lines: list[str] = [f"SDPO debug examples for batch {batch_index}"]
+    for i, example in enumerate(debug_examples):
+        lines.append("")
+        lines.append(f"[example {i}]")
+        for key in (
+            "group_index",
+            "sample_index_in_group",
+            "reward",
+            "fen",
+            "expected_answer",
+            "stockfish_best_move",
+            "stockfish_cp_loss",
+        ):
+            value = example.get(key)
+            if value is not None and value != "":
+                lines.append(f"{key}: {value}")
+        for text_key in (
+            "prompt",
+            "model_output",
+            "teacher_solution",
+            "stockfish_hint",
+            "combined_feedback",
+        ):
+            text_value = example.get(text_key)
+            if isinstance(text_value, str) and text_value:
+                lines.append(f"{text_key}:")
+                lines.append(text_value)
+    return "\n".join(lines)
+
+
+def _append_debug_examples_jsonl(
+    log_path: str,
+    file_name: str,
+    batch_index: int,
+    debug_examples: Sequence[Mapping[str, Any]],
+) -> str:
+    out_path = file_name
+    if not os.path.isabs(out_path):
+        out_path = os.path.join(log_path, out_path)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "a", encoding="utf-8") as f:
+        for example in debug_examples:
+            payload = {"batch_index": batch_index, "batch_number": batch_index + 1}
+            payload.update(example)
+            f.write(json.dumps(payload, ensure_ascii=True) + "\n")
+    return out_path
+
+
 def _extract_single_turn_tokens(
     state: Mapping[str, Any],
     strict_single_turn: bool,
@@ -302,6 +433,7 @@ def _extract_rollout_sample(
     )
     reward = float(state.get("reward") or 0.0)
     feedback_text = extract_feedback_text(state, feedback_keys)
+    expected_answer = _extract_expected_answer_text(state)
     response_text = tokenizer.decode(completion_tokens, skip_special_tokens=True)
 
     return RolloutSample(
@@ -312,6 +444,7 @@ def _extract_rollout_sample(
         completion_logprobs=completion_logprobs,
         reward=reward,
         feedback_text=feedback_text,
+        expected_answer=expected_answer,
         response_text=response_text,
     )
 
@@ -795,6 +928,10 @@ async def build_group_sdpo_datums(
     feedback_keys: Sequence[str],
     teacher_logprob_semaphore: asyncio.Semaphore | None,
     stockfish_hint_extractor: Any | None,
+    group_index: int | None = None,
+    debug_examples_sink: list[dict[str, Any]] | None = None,
+    debug_examples_limit: int = 0,
+    debug_examples_max_text_chars: int = 0,
 ) -> tuple[list[tinker.Datum], GroupSdpoStats]:
     records: list[RolloutSample] = []
     stats = GroupSdpoStats()
@@ -959,16 +1096,22 @@ async def build_group_sdpo_datums(
         stockfish_cp_loss = 0.0
         stockfish_cp_loss_estimated = False
         stockfish_feedback_used = False
+        stockfish_best_move_uci: str | None = None
+        stockfish_predicted_move_uci: str | None = None
         stockfish_verification_candidate = verification_candidate_by_idx[i]
         stockfish_verification_scheduled = verification_scheduled_by_idx[i]
         verification_task = verification_task_by_idx[i]
+        verification_obj: Any | None = None
         if verification_task is not None:
             verification = verification_task.result()
             if verification is not None:
+                verification_obj = verification
                 stockfish_verified = True
                 stockfish_move_is_legal = verification.move_is_legal
                 stockfish_cp_loss = float(verification.cp_loss)
                 stockfish_cp_loss_estimated = verification.cp_loss_source != "centipawn"
+                stockfish_best_move_uci = getattr(verification, "best_move_uci", None)
+                stockfish_predicted_move_uci = getattr(verification, "predicted_move_uci", None)
                 should_add_stockfish_feedback = (
                     config.include_stockfish_move_feedback
                     and stockfish_cp_loss >= config.stockfish_feedback_cp_loss_threshold
@@ -996,6 +1139,59 @@ async def build_group_sdpo_datums(
             include_hints=config.enable_stockfish_hints,
             hints_only_without_solution=config.stockfish_hints_only_without_solution,
         )
+
+        if (
+            debug_examples_sink is not None
+            and debug_examples_limit > 0
+            and len(debug_examples_sink) < debug_examples_limit
+        ):
+            expected_answer = sample.expected_answer or stockfish_best_move_uci
+            debug_examples_sink.append(
+                {
+                    "group_index": group_index if group_index is not None else -1,
+                    "sample_index_in_group": i,
+                    "reward": float(sample.reward),
+                    "fen": sample.fen,
+                    "prompt": _truncate_debug_text(
+                        _prompt_messages_to_text(sample.prompt_messages),
+                        debug_examples_max_text_chars,
+                    ),
+                    "model_output": _truncate_debug_text(
+                        sample.response_text,
+                        debug_examples_max_text_chars,
+                    ),
+                    "expected_answer": _truncate_debug_text(
+                        expected_answer,
+                        debug_examples_max_text_chars,
+                    ),
+                    "teacher_solution": _truncate_debug_text(
+                        solution_text,
+                        debug_examples_max_text_chars,
+                    ),
+                    "combined_feedback": _truncate_debug_text(
+                        combined_feedback_text,
+                        debug_examples_max_text_chars,
+                    ),
+                    "stockfish_hint": _truncate_debug_text(
+                        stockfish_hints_text,
+                        debug_examples_max_text_chars,
+                    ),
+                    "used_reprompt": bool(used_reprompt),
+                    "feedback_used": bool(feedback_used),
+                    "stockfish_hint_used": bool(stockfish_hint_used),
+                    "stockfish_verification_scheduled": bool(stockfish_verification_scheduled),
+                    "stockfish_verified": bool(stockfish_verified),
+                    "stockfish_predicted_move": stockfish_predicted_move_uci,
+                    "stockfish_best_move": stockfish_best_move_uci,
+                    "stockfish_move_is_legal": bool(stockfish_move_is_legal),
+                    "stockfish_cp_loss": float(stockfish_cp_loss),
+                    "stockfish_cp_loss_estimated": bool(stockfish_cp_loss_estimated),
+                    "stockfish_feedback_text": _truncate_debug_text(
+                        getattr(verification_obj, "feedback_text", None),
+                        debug_examples_max_text_chars,
+                    ),
+                }
+            )
 
         async def _build_datum(
             rollout_sample: RolloutSample = sample,
@@ -1134,6 +1330,9 @@ async def run_sdpo_batch_update(
     tokenizer: Tokenizer,
     states_by_group: Sequence[Sequence[Mapping[str, Any]]],
     stockfish_hint_extractor: Any | None,
+    debug_examples_sink: list[dict[str, Any]] | None = None,
+    debug_examples_limit: int = 0,
+    debug_examples_max_text_chars: int = 0,
 ) -> dict[str, Any]:
     if not 0.0 <= config.grpo_mix_lambda <= 1.0:
         raise ValueError(f"grpo_mix_lambda must be in [0, 1], got {config.grpo_mix_lambda}")
@@ -1148,6 +1347,8 @@ async def run_sdpo_batch_update(
             "stockfish_verification_sample_rate must be in [0, 1], got "
             f"{config.stockfish_verification_sample_rate}"
         )
+    if debug_examples_limit < 0:
+        raise ValueError(f"debug_examples_limit must be >= 0, got {debug_examples_limit}")
     if config.full_logit_distillation and (config.distillation_topk is None or config.distillation_topk <= 0):
         raise ValueError(
             "full_logit_distillation=True requires distillation_topk to be a positive integer"
@@ -1161,7 +1362,7 @@ async def run_sdpo_batch_update(
     all_data: list[tinker.Datum] = []
     total_stats = GroupSdpoStats()
 
-    for states in states_by_group:
+    for i_group, states in enumerate(states_by_group):
         group_data, group_stats = await build_group_sdpo_datums(
             states=states,
             config=config,
@@ -1173,6 +1374,10 @@ async def run_sdpo_batch_update(
             feedback_keys=feedback_keys,
             teacher_logprob_semaphore=teacher_logprob_semaphore,
             stockfish_hint_extractor=stockfish_hint_extractor,
+            group_index=i_group,
+            debug_examples_sink=debug_examples_sink,
+            debug_examples_limit=debug_examples_limit,
+            debug_examples_max_text_chars=debug_examples_max_text_chars,
         )
         all_data.extend(group_data)
 
@@ -1405,6 +1610,19 @@ async def main(config: Config):
         )
     if config.stockfish_num_workers <= 0:
         raise ValueError(f"stockfish_num_workers must be >= 1, got {config.stockfish_num_workers}")
+    if config.debug_examples_every_n_steps < 0:
+        raise ValueError(
+            f"debug_examples_every_n_steps must be >= 0, got {config.debug_examples_every_n_steps}"
+        )
+    if config.debug_examples_per_step <= 0:
+        raise ValueError(f"debug_examples_per_step must be >= 1, got {config.debug_examples_per_step}")
+    if config.debug_examples_max_text_chars <= 0:
+        raise ValueError(
+            "debug_examples_max_text_chars must be >= 1, got "
+            f"{config.debug_examples_max_text_chars}"
+        )
+    if not config.debug_examples_file_name.strip():
+        raise ValueError("debug_examples_file_name must be non-empty")
 
     ml_logger = ml_log.setup_logging(
         log_dir=config.log_path,
@@ -1525,6 +1743,11 @@ async def main(config: Config):
                     desc=f"SDPO sampling batch {i_batch}",
                 )
 
+            should_log_debug_examples = (
+                config.debug_examples_every_n_steps > 0
+                and (i_batch + 1) % config.debug_examples_every_n_steps == 0
+            )
+            debug_examples: list[dict[str, Any]] = []
             sdpo_metrics = await run_sdpo_batch_update(
                 config=config,
                 training_client=training_client,
@@ -1535,8 +1758,36 @@ async def main(config: Config):
                 tokenizer=tokenizer,
                 states_by_group=states_by_group,
                 stockfish_hint_extractor=stockfish_hint_extractor,
+                debug_examples_sink=debug_examples if should_log_debug_examples else None,
+                debug_examples_limit=config.debug_examples_per_step,
+                debug_examples_max_text_chars=config.debug_examples_max_text_chars,
             )
             metrics.update(sdpo_metrics)
+            metrics["sdpo/debug_examples_logged"] = 0.0
+
+            if should_log_debug_examples:
+                debug_path = _append_debug_examples_jsonl(
+                    log_path=config.log_path,
+                    file_name=config.debug_examples_file_name,
+                    batch_index=i_batch,
+                    debug_examples=debug_examples,
+                )
+                metrics["sdpo/debug_examples_logged"] = float(len(debug_examples))
+                logger.info(
+                    "Wrote %d SDPO debug examples for batch %d to %s",
+                    len(debug_examples),
+                    i_batch,
+                    debug_path,
+                )
+                if debug_examples:
+                    long_text = _format_debug_examples_long_text(
+                        batch_index=i_batch,
+                        debug_examples=debug_examples,
+                    )
+                    ml_logger.log_long_text(
+                        key=f"sdpo/debug_examples/batch_{i_batch:06d}",
+                        text=long_text,
+                    )
 
             if config.save_every > 0 and (i_batch + 1) % config.save_every == 0:
                 with timed("save_checkpoint", metrics):

@@ -232,7 +232,35 @@ Relevant metrics:
 - `sdpo/stockfish_avg_cp_loss`
 - `sdpo/stockfish_estimated_cp_loss_fraction`
 
-## 7. Suggested W&B dashboard panels
+## 7. Qualitative debug examples
+
+To inspect model behavior over time, enable periodic example dumps:
+
+```bash
+debug_examples_every_n_steps=10 \
+debug_examples_per_step=3 \
+debug_examples_max_text_chars=4000 \
+debug_examples_file_name=sdpo_debug_examples.jsonl
+```
+
+Each logged record includes:
+
+- prompt (rendered from messages)
+- model output
+- expected answer (from environment state; falls back to Stockfish best move when available)
+- Stockfish hint text
+- reward and Stockfish verification fields (cp-loss, best/predicted move, legality)
+
+Output file:
+
+- `<log_path>/sdpo_debug_examples.jsonl`
+- `<log_path>/long_text.jsonl` (human-readable snapshots; also mirrored to W&B text logs when enabled)
+
+Metric:
+
+- `sdpo/debug_examples_logged`
+
+## 8. Suggested W&B dashboard panels
 
 Create panels for:
 
@@ -242,7 +270,7 @@ Create panels for:
 - Chess move quality: `sdpo/stockfish_avg_cp_loss`, `sdpo/stockfish_legal_move_fraction`.
 - Data quality: `sdpo/num_skipped_samples`, `sdpo/num_zero_adv_samples`.
 
-## 8. Reproducibility checklist
+## 9. Reproducibility checklist
 
 - Pin model ID and exact environment version.
 - Keep `log_path` stable per run family for resume behavior.
@@ -272,7 +300,7 @@ Rationale:
 - Keep 20-40 CPU cores for Python/env overhead and OS.
 - Raise `stockfish_hash_mb` only if RAM headroom remains stable under full concurrency.
 
-## 9. Common pitfalls
+## 10. Common pitfalls
 
 - `strict_single_turn=true` will fail on multi-turn traces. Flatten to one completion segment or set `strict_single_turn=false`.
 - If `stockfish_estimated_cp_loss_fraction` is high, many cp-loss values came from WDL/fallback rather than raw cp deltas.

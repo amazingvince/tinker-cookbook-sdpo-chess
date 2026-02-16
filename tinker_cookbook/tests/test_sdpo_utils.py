@@ -87,6 +87,7 @@ def _make_state(
     completion_logprobs: list[float],
     reward: float,
     feedback_text: str | None = None,
+    answer: str | None = None,
 ) -> dict[str, Any]:
     state: dict[str, Any] = {
         "prompt": prompt_messages,
@@ -103,6 +104,8 @@ def _make_state(
     }
     if feedback_text is not None:
         state["info"] = {"feedback": feedback_text}
+    if answer is not None:
+        state["answer"] = answer
     return state
 
 
@@ -153,6 +156,27 @@ def test_extract_feedback_text_precedence_and_shapes():
 
     state_empty = {"info": {"feedback": []}}
     assert extract_feedback_text(state_empty, keys) is None
+
+
+def test_extract_expected_answer_text_precedence():
+    state_top_level = {
+        "expected_answer": "  e2e4  ",
+        "info": {"answer": "d2d4"},
+    }
+    assert sdpo_train._extract_expected_answer_text(state_top_level) == "e2e4"
+
+    state_nested = {
+        "rollout_input": {"answer": "g1f3"},
+        "info": {"stockfish_best_move": "c2c4"},
+    }
+    assert sdpo_train._extract_expected_answer_text(state_nested) == "g1f3"
+
+    state_stockfish_fallback = {
+        "info": {"stockfish_best_move": "b1c3"},
+    }
+    assert sdpo_train._extract_expected_answer_text(state_stockfish_fallback) == "b1c3"
+
+    assert sdpo_train._extract_expected_answer_text({"info": {}}) is None
 
 
 def test_select_solution_idx_group_logic():
@@ -480,6 +504,99 @@ def test_run_sdpo_batch_update_mocked_path(monkeypatch):
         assert metrics["sdpo/num_skipped_samples"] == 0
         assert metrics["sdpo/mean_abs_advantage"] > 0.0
         assert metrics["optim/mock_called"] == 1.0
+
+    asyncio.run(_inner())
+
+
+def test_run_sdpo_batch_update_collects_debug_examples(monkeypatch):
+    class _FakeStockfishHintExtractor:
+        def analyze_and_render(self, fen: str) -> str:
+            return f"hints for {fen}"
+
+        def verify_predicted_move(
+            self,
+            fen: str,
+            predicted_text: str,
+            depth: int = 20,
+            illegal_move_cp_loss: float = 1000.0,
+        ) -> Any:
+            _ = (fen, predicted_text, depth, illegal_move_cp_loss)
+            return SimpleNamespace(
+                move_is_legal=True,
+                cp_loss=12.5,
+                cp_loss_source="centipawn",
+                predicted_move_uci="e2e4",
+                best_move_uci="g1f3",
+                feedback_text="Prefer development with g1f3.",
+            )
+
+    async def fake_train_step(
+        data_D: list[sdpo_train.tinker.Datum],
+        training_client: Any,
+        learning_rate: float,
+        num_substeps: int,
+        loss_fn: str,
+        loss_fn_config: dict[str, Any] | None = None,
+        metrics: dict[str, Any] | None = None,
+    ):
+        _ = (
+            data_D,
+            training_client,
+            learning_rate,
+            num_substeps,
+            loss_fn,
+            loss_fn_config,
+            metrics,
+        )
+        return []
+
+    monkeypatch.setattr(sdpo_train.rl_train, "train_step", fake_train_step)
+
+    async def _inner():
+        config = _make_config(
+            teacher_regularization="none",
+            enable_stockfish_hints=True,
+            reprompt_template="{prompt}{solution}{feedback}{hints}",
+        )
+        state = _make_state(
+            prompt_messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        "FEN: rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+                    ),
+                }
+            ],
+            prompt_ids=[10, 11],
+            completion_ids=[12, 13],
+            completion_logprobs=[-1.2, -1.1],
+            reward=0.0,
+            answer="e2e4",
+        )
+
+        debug_examples: list[dict[str, Any]] = []
+        _ = await sdpo_train.run_sdpo_batch_update(
+            config=config,
+            training_client=object(),
+            current_sampling_client=_FakeSamplingClient(base_logprob=-0.2),
+            reference_sampling_client=None,
+            ema_teacher_sampling_clients=None,
+            renderer=_FakeRenderer(),
+            tokenizer=_FakeTokenizer(),
+            states_by_group=[[state]],
+            stockfish_hint_extractor=_FakeStockfishHintExtractor(),
+            debug_examples_sink=debug_examples,
+            debug_examples_limit=1,
+            debug_examples_max_text_chars=500,
+        )
+
+        assert len(debug_examples) == 1
+        example = debug_examples[0]
+        assert example["expected_answer"] == "e2e4"
+        assert "hints for rnbqkbnr" in str(example["stockfish_hint"])
+        assert example["model_output"] == "12 13"
+        assert example["stockfish_best_move"] == "g1f3"
+        assert example["stockfish_predicted_move"] == "e2e4"
 
     asyncio.run(_inner())
 

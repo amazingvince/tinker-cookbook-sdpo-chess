@@ -144,6 +144,13 @@ class JsonLogger(Logger):
             f.write(json.dumps(log_entry) + "\n")
             logger.info("Wrote metrics to %s", self.metrics_file)
 
+    def log_long_text(self, key: str, text: str) -> None:
+        """Append long text logs to a sidecar JSONL file."""
+        long_text_file = self.log_dir / "long_text.jsonl"
+        with open(long_text_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"key": key, "text": text}, ensure_ascii=True) + "\n")
+        logger.info("Wrote long text log to %s", long_text_file)
+
 
 class PrettyPrintLogger(Logger):
     """Logger that displays metrics in a formatted table in the console."""
@@ -181,6 +188,12 @@ class PrettyPrintLogger(Logger):
 
         with _rich_console_use_logger(self.console):
             self.console.print(table)
+
+    def log_long_text(self, key: str, text: str) -> None:
+        """Display long text logs in console."""
+        with _rich_console_use_logger(self.console):
+            self.console.print(f"[bold cyan]{key}[/bold cyan]")
+            self.console.print(text)
 
 
 def _maybe_truncate_repr(value: Any) -> str:
@@ -236,6 +249,11 @@ class WandbLogger(Logger):
         if self.run and wandb is not None:
             wandb.log(metrics, step=step)
             logger.info("Logging to: %s", self.run.url)
+
+    def log_long_text(self, key: str, text: str) -> None:
+        """Log long text to wandb as a string field."""
+        if self.run and wandb is not None:
+            wandb.log({key: text})
 
     def close(self) -> None:
         """Close wandb run."""

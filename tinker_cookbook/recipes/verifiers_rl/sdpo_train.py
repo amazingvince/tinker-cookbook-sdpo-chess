@@ -42,6 +42,10 @@ class CLIConfig:
     log_path: str | None = None
     wandb_project: str | None = None
     wandb_name: str | None = None
+    debug_examples_every_n_steps: int = 0
+    debug_examples_per_step: int = 2
+    debug_examples_max_text_chars: int = 4000
+    debug_examples_file_name: str = "sdpo_debug_examples.jsonl"
     behavior_if_log_dir_exists: cli_utils.LogdirBehavior = "ask"
 
     # SDPO configuration
@@ -152,6 +156,10 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
         ttl_seconds=cli_config.ttl_seconds,
         wandb_project=cli_config.wandb_project,
         wandb_name=cli_config.wandb_name or run_name,
+        debug_examples_every_n_steps=cli_config.debug_examples_every_n_steps,
+        debug_examples_per_step=cli_config.debug_examples_per_step,
+        debug_examples_max_text_chars=cli_config.debug_examples_max_text_chars,
+        debug_examples_file_name=cli_config.debug_examples_file_name,
         group_size=cli_config.group_size,
         max_concurrent_generation=cli_config.max_concurrent_generation,
         max_concurrent_scoring=cli_config.max_concurrent_scoring,

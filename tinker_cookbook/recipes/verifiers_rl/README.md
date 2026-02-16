@@ -126,6 +126,21 @@ Helper utilities for chess runtime setup:
 - `python -m tinker_cookbook.recipes.verifiers_rl.install_stockfish`
 - `python -m tinker_cookbook.recipes.verifiers_rl.install_syzygy`
 
+To log periodic qualitative debug samples (prompt, model output, expected answer, Stockfish hint):
+
+```bash
+python -m tinker_cookbook.recipes.verifiers_rl.sdpo_train \
+  ... \
+  debug_examples_every_n_steps=10 \
+  debug_examples_per_step=3 \
+  debug_examples_max_text_chars=4000 \
+  debug_examples_file_name=sdpo_debug_examples.jsonl
+```
+
+This writes JSONL records to `<log_path>/sdpo_debug_examples.jsonl` (or your configured file name),
+adds `sdpo/debug_examples_logged` to `metrics.jsonl`, and also emits long-form text snapshots into
+`<log_path>/long_text.jsonl` (plus W&B text logs if W&B is enabled).
+
 To create a starter JSONL dataset of random FENs from Lichess puzzles + games:
 
 ```bash
