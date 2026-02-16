@@ -831,6 +831,7 @@ async def build_group_sdpo_datums(
             config.enable_stockfish_hints
             and stockfish_hint_extractor is not None
             and sample.fen is not None
+            and (not config.stockfish_hints_only_without_solution or not bool(solution_text))
         ):
             if sample.fen not in stockfish_hints_by_fen:
                 try:
