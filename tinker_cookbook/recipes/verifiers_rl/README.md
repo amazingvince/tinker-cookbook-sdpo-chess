@@ -23,6 +23,44 @@ python -m tinker_cookbook.recipes.verifiers_rl.train vf_env_id=env-id vf_env_arg
 
 The reverse-text example as configured should climb from ~0.2 to ~0.35 in 32 steps.
 
+## SDPO Training Recipe
+
+This folder also includes an SDPO recipe for token-level, on-policy SDPO with verifiers environments:
+
+```bash
+python -m tinker_cookbook.recipes.verifiers_rl.sdpo_train \
+  vf_env_id=env-id \
+  vf_env_args='{}' \
+  model_name=Qwen/Qwen3-4B-Instruct-2507 \
+  groups_per_batch=32 \
+  group_size=8
+```
+
+The SDPO recipe:
+- defaults to one optimizer update per freshly sampled batch (on-policy), with optional off-policy batch reuse via `updates_per_batch > 1`;
+- builds teacher reprompts from successful peer solutions and/or environment feedback;
+- supports teacher regularization via `trust_region` (fixed reference sampler) or `ema` (EMA distribution over recent on-policy samplers);
+- supports optional full-logit distillation with top-k + tail approximation (`full_logit_distillation`, `distillation_topk`, `distillation_add_tail`);
+- supports optional off-policy updates by reusing a sampled batch with Tinker RL losses (`updates_per_batch`, `loss_fn`, `loss_fn_config_json`);
+- fails fast on multi-turn traces by default (`strict_single_turn=True`).
+- supports optional SDPO+GRPO mixing (`grpo_mix_lambda`) and `token` vs `sequence` advantage modes.
+- supports reprompt truncation behavior (`reprompt_truncation=right|left|error`).
+
+Expected SDPO metrics in `metrics.jsonl`:
+- `sdpo/success_group_fraction`
+- `sdpo/success_sample_fraction`
+- `sdpo/feedback_available_fraction`
+- `sdpo/feedback_used_fraction`
+- `sdpo/reprompt_sample_fraction`
+- `sdpo/mean_advantage`
+- `sdpo/mean_abs_advantage`
+- `sdpo/num_zero_adv_samples`
+- `sdpo/num_skipped_samples`
+- `sdpo/grpo_mix_lambda`
+- `sdpo/full_logit_distillation`
+- `sdpo/topk_overlap_fraction`
+- `sdpo/updates_per_batch`
+
 You can also evaluate offline:
 
 ```bash
