@@ -25,7 +25,7 @@ The SDPO path in this repo is implemented in:
 Core behavior:
 
 - Token-level SDPO advantages from teacher-vs-rollout logprobs.
-- On-policy rollouts by default (`updates_per_batch=1`).
+- On-policy training only (`updates_per_batch` must be `1`).
 - Teacher reprompting with successful peer solutions and optional environment feedback.
 - Optional teacher regularization (`trust_region`, `ema`, `none`).
 - Optional full-logit distillation (`distillation_topk` + tail).
@@ -135,8 +135,86 @@ Important:
 - They are related but not identical; use the presets below as practical parity settings.
 - `max_reprompt_tokens=0` disables truncation so long teacher hints are preserved.
 - `student_max_thinking_tokens` bounds `<think>...</think>` token count during rollout (`0` disables).
+- For Stockfish efficiency, default shared mode is `stockfish_shared_hint_and_verification_eval=true` with
+  `stockfish_shared_eval_mode=two_pass` (wide hints + deep scoring), and
+  `stockfish_verification_multipv=1` for fast deep truth labels (raise only if you need broad deep candidates).
+- `stockfish_persistent_cache_dir` enables cross-run reuse of Stockfish analyses/verifications.
 
 ## 5. Ready-to-run parity commands
+
+### Dataset wiring (HF puzzles + games mix)
+
+Use the built-in `hf-chess-mix` environment so training samples positions from both:
+- `Lichess/chess-puzzles` (expanded to per-move puzzle examples with solver-side moves by default),
+- `Lichess/standard-chess-games` (multiple random plies sampled per game, with Stockfish-labeled moves by default).
+
+Example `vf_env_args` payload:
+
+```json
+{
+  "max_examples": 20000,
+  "puzzles_fraction": 0.5,
+  "puzzle_solver_moves_only": true,
+  "max_puzzle_solver_moves_per_puzzle": -1,
+  "game_positions_per_game": 3,
+  "game_answer_mode": "stockfish",
+  "use_stockfish_game_reward": true,
+  "stockfish_path": "stockfish",
+  "stockfish_depth": 20,
+  "stockfish_syzygy_path": "/path/to/syzygy",
+  "stockfish_syzygy_max_pieces": 5,
+  "stockfish_persistent_cache_dir": "/path/to/shared-stockfish-cache",
+  "stockfish_shared_hint_and_verification_eval": true,
+  "stockfish_shared_eval_mode": "two_pass",
+  "stockfish_verification_multipv": 1,
+  "game_reward_syzygy_wdl_scale": 1.0,
+  "game_reward_syzygy_dtz_scale": 20.0,
+  "game_reward_pv_overlap_bonus": 0.05,
+  "game_reward_pv_motif_plies": 6,
+  "game_reward_use_confidence_weighting": true,
+  "game_reward_confidence_neutral": 0.5,
+  "game_reward_confidence_nodes_reference": 500000,
+  "game_reward_confidence_seldepth_factor": 1.5,
+  "max_scan_rows_per_source": 200000,
+  "oversample_factor": 4,
+  "shuffle_buffer_size": 10000,
+  "min_puzzle_rating": 1200,
+  "min_game_average_elo": 1600,
+  "min_game_ply": 4,
+  "max_game_ply": 100
+}
+```
+
+### Game reward model (Stockfish-labeled game positions)
+
+For `source=lichess_game`, reward uses legality plus smooth distance to Stockfish best:
+
+1. Parse predicted move from model output.
+2. If illegal/unparsed: reward `= 0`.
+3. Compute base quality:
+   - `q = exp(-(best_expected_score - predicted_expected_score) / game_reward_expected_score_temperature)`
+   - fallback `q = exp(-cp_loss / game_reward_cp_loss_scale)` if expected-score comparison is unavailable.
+4. Apply Syzygy penalties (when TB probes are available):
+   - `q *= exp(-wdl_penalty / game_reward_syzygy_wdl_scale)`
+   - `q *= exp(-dtz_penalty / game_reward_syzygy_dtz_scale)`.
+5. Add PV motif overlap bonus:
+   - `q += game_reward_pv_overlap_bonus * overlap(best_pv_tail, predicted_pv_tail)`.
+6. Optionally confidence-weight `q` using Stockfish search stability (depth/seldepth/nodes):
+   - `q <- neutral + confidence * (q - neutral)`.
+7. Map to final reward:
+   - `reward = game_reward_legal_floor + (1 - game_reward_legal_floor) * q`
+   - add `game_reward_best_move_bonus` when predicted move equals Stockfish best move.
+
+### Trap-analysis hints
+
+When Stockfish hints are enabled, the rendered teacher hint now includes a
+`Trap analysis (future-state refutations)` section for high-`delta_E` moves:
+
+- severity labels (`critical`, `major`, `moderate`, `minor`);
+- short refutation tail from PV lookahead;
+- motif tags (material drop, king-safety tactic, tactical-capture sequence, unsound checking idea, etc.).
+
+For `source=lichess_puzzle`, reward remains exact match to the selected puzzle-line target move.
 
 ### A) Rich-feedback-style SDPO parity (from `run_sdpo.sh`)
 
@@ -144,8 +222,8 @@ Important:
 cd /Users/vincent/Documents/SDPO/tinker-cookbook
 
 python -m tinker_cookbook.recipes.verifiers_rl.sdpo_train \
-  vf_env_id=your_chess_env \
-  vf_env_args='{}' \
+  vf_env_id=hf-chess-mix \
+  vf_env_args='{"max_examples":20000,"puzzles_fraction":0.5,"puzzle_solver_moves_only":true,"game_positions_per_game":3,"game_answer_mode":"stockfish","use_stockfish_game_reward":true,"stockfish_path":"stockfish","stockfish_depth":20,"stockfish_syzygy_path":"/path/to/syzygy","stockfish_syzygy_max_pieces":5,"game_reward_pv_overlap_bonus":0.05,"game_reward_use_confidence_weighting":true,"min_game_ply":4,"max_game_ply":100,"min_game_average_elo":1600}' \
   model_name=Qwen/Qwen3-8B \
   groups_per_batch=32 \
   group_size=8 \
@@ -176,8 +254,8 @@ python -m tinker_cookbook.recipes.verifiers_rl.sdpo_train \
 cd /Users/vincent/Documents/SDPO/tinker-cookbook
 
 python -m tinker_cookbook.recipes.verifiers_rl.sdpo_train \
-  vf_env_id=your_chess_env \
-  vf_env_args='{}' \
+  vf_env_id=hf-chess-mix \
+  vf_env_args='{"max_examples":20000,"puzzles_fraction":0.5,"puzzle_solver_moves_only":true,"game_positions_per_game":3,"game_answer_mode":"stockfish","use_stockfish_game_reward":true,"stockfish_path":"stockfish","stockfish_depth":20,"stockfish_syzygy_path":"/path/to/syzygy","stockfish_syzygy_max_pieces":5,"game_reward_pv_overlap_bonus":0.05,"game_reward_use_confidence_weighting":true,"min_game_ply":4,"max_game_ply":100,"min_game_average_elo":1600}' \
   model_name=Qwen/Qwen3-8B \
   groups_per_batch=32 \
   group_size=8 \
@@ -233,8 +311,13 @@ Relevant metrics:
 - `sdpo/stockfish_verification_scheduled_fraction`
 - `sdpo/stockfish_verified_fraction`
 - `sdpo/stockfish_legal_move_fraction`
+- `sdpo/stockfish_best_move_fraction`
 - `sdpo/stockfish_feedback_fraction`
 - `sdpo/stockfish_avg_cp_loss`
+- `sdpo/stockfish_accuracy` (best-move accuracy on verified samples)
+- `sdpo/stockfish_acpl` (average centipawn loss alias)
+- `chess/acc`
+- `chess/acpl`
 - `sdpo/stockfish_estimated_cp_loss_fraction`
 
 ## 7. Qualitative debug examples

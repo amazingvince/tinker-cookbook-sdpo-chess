@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import math
@@ -9,7 +10,7 @@ import os
 import time
 from collections import deque
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import chz
@@ -72,6 +73,7 @@ class GroupSdpoStats:
     stockfish_verification_scheduled_samples: int = 0
     stockfish_verified_samples: int = 0
     stockfish_legal_move_samples: int = 0
+    stockfish_best_move_samples: int = 0
     stockfish_cp_loss_sum: float = 0.0
     stockfish_estimated_cp_loss_samples: int = 0
     stockfish_feedback_samples: int = 0
@@ -83,6 +85,8 @@ class GroupSdpoStats:
     advantage_count: int = 0
     topk_overlap_count: int = 0
     topk_total_count: int = 0
+    env_metric_sums: dict[str, float] = field(default_factory=dict)
+    env_metric_counts: dict[str, int] = field(default_factory=dict)
 
 
 @chz.chz
@@ -167,6 +171,7 @@ class Config:
     stockfish_max_weak_square_items: int = 8
     stockfish_syzygy_path: str | None = None
     stockfish_syzygy_max_pieces: int = 5
+    stockfish_persistent_cache_dir: str | None = None
     stockfish_unknown_score_cp_loss: float = 80.0
     stockfish_hints_template: str = (
         "\nTeacher-only analysis notes (private, do not reference explicitly):\n\n"
@@ -176,6 +181,9 @@ class Config:
     enable_stockfish_move_verification: bool = True
     stockfish_verification_sample_rate: float = 1.0
     stockfish_verification_depth: int = 20
+    stockfish_verification_multipv: int = 1
+    stockfish_shared_hint_and_verification_eval: bool = True
+    stockfish_shared_eval_mode: Literal["single", "two_pass"] = "two_pass"
     stockfish_illegal_move_cp_loss: float = 1000.0
     include_stockfish_move_feedback: bool = True
     stockfish_feedback_cp_loss_threshold: float = 0.0
@@ -228,23 +236,99 @@ async def _stockfish_verify_predicted_move_async(
     fen: str,
     predicted_text: str,
     depth: int,
+    multipv: int | None,
     illegal_move_cp_loss: float,
 ) -> Any:
     verify_async = getattr(stockfish_client, "verify_predicted_move_async", None)
     if callable(verify_async):
-        return await verify_async(
+        try:
+            return await verify_async(
+                fen=fen,
+                predicted_text=predicted_text,
+                depth=depth,
+                verification_multipv=multipv,
+                illegal_move_cp_loss=illegal_move_cp_loss,
+            )
+        except TypeError:
+            return await verify_async(
+                fen=fen,
+                predicted_text=predicted_text,
+                depth=depth,
+                illegal_move_cp_loss=illegal_move_cp_loss,
+            )
+
+    verify_sync = getattr(stockfish_client, "verify_predicted_move", None)
+    if verify_sync is None:
+        raise AttributeError("stockfish_client is missing verify_predicted_move")
+    try:
+        return await asyncio.to_thread(
+            verify_sync,
+            fen,
+            predicted_text,
+            depth,
+            illegal_move_cp_loss,
+            multipv,
+        )
+    except TypeError:
+        return await asyncio.to_thread(
+            verify_sync,
+            fen,
+            predicted_text,
+            depth,
+            illegal_move_cp_loss,
+        )
+
+
+async def _stockfish_analyze_and_verify_async(
+    stockfish_client: Any,
+    *,
+    fen: str,
+    predicted_text: str,
+    hint_depth: int,
+    hint_multipv: int,
+    verification_depth: int,
+    verification_multipv: int,
+    illegal_move_cp_loss: float,
+    mode: Literal["single", "two_pass"],
+) -> tuple[str, Any | None]:
+    analyze_and_verify_async = getattr(stockfish_client, "analyze_and_verify_async", None)
+    if callable(analyze_and_verify_async):
+        return await analyze_and_verify_async(
             fen=fen,
             predicted_text=predicted_text,
-            depth=depth,
+            hint_depth=hint_depth,
+            hint_multipv=hint_multipv,
+            verification_depth=verification_depth,
+            verification_multipv=verification_multipv,
             illegal_move_cp_loss=illegal_move_cp_loss,
+            mode=mode,
         )
-    return await asyncio.to_thread(
-        stockfish_client.verify_predicted_move,
-        fen,
-        predicted_text,
-        depth,
-        illegal_move_cp_loss,
+
+    analyze_and_verify = getattr(stockfish_client, "analyze_and_verify", None)
+    if callable(analyze_and_verify):
+        return await asyncio.to_thread(
+            analyze_and_verify,
+            fen,
+            predicted_text,
+            hint_depth=hint_depth,
+            hint_multipv=hint_multipv,
+            verification_depth=verification_depth,
+            verification_multipv=verification_multipv,
+            illegal_move_cp_loss=illegal_move_cp_loss,
+            mode=mode,
+        )
+
+    # Compatibility fallback for older stockfish clients without combined APIs.
+    hints_text = await _stockfish_analyze_and_render_async(stockfish_client, fen)
+    verification = await _stockfish_verify_predicted_move_async(
+        stockfish_client=stockfish_client,
+        fen=fen,
+        predicted_text=predicted_text,
+        depth=verification_depth,
+        multipv=verification_multipv,
+        illegal_move_cp_loss=illegal_move_cp_loss,
     )
+    return hints_text, verification
 
 
 def _normalize_prompt_messages(prompt_value: Any) -> list[renderers.Message]:
@@ -272,6 +356,25 @@ def _coerce_text(value: Any) -> str | None:
             if nested:
                 return nested
     return None
+
+
+def _accumulate_numeric_env_metrics(
+    stats: GroupSdpoStats,
+    metrics_value: Any,
+) -> None:
+    if not isinstance(metrics_value, Mapping):
+        return
+    for key, value in metrics_value.items():
+        if not isinstance(key, str) or not key:
+            continue
+        if isinstance(value, bool):
+            numeric_value = float(value)
+        elif isinstance(value, (int, float)):
+            numeric_value = float(value)
+        else:
+            continue
+        stats.env_metric_sums[key] = stats.env_metric_sums.get(key, 0.0) + numeric_value
+        stats.env_metric_counts[key] = stats.env_metric_counts.get(key, 0) + 1
 
 
 def _extract_expected_answer_text(state: Mapping[str, Any]) -> str | None:
@@ -431,22 +534,57 @@ def _extract_single_turn_tokens(
     return list(prompt_ids), list(completion_ids), completion_logprobs_f
 
 
+def _extract_completion_text(state: Mapping[str, Any]) -> str | None:
+    completion = state.get("completion")
+    if isinstance(completion, list):
+        for message in reversed(completion):
+            if not isinstance(message, Mapping):
+                continue
+            content = renderers.format_content_as_string(message.get("content", ""))
+            if content:
+                return content
+    elif isinstance(completion, str):
+        content = completion.strip()
+        if content:
+            return content
+
+    for key in ("response", "output", "text", "assistant_response"):
+        content = _coerce_text(state.get(key))
+        if content:
+            return content
+
+    return None
+
+
 def _extract_rollout_sample(
     state: Mapping[str, Any],
     feedback_keys: Sequence[str],
+    renderer: renderers.Renderer,
     tokenizer: Tokenizer,
     strict_single_turn: bool,
 ) -> RolloutSample:
     prompt_messages = _normalize_prompt_messages(state.get("prompt"))
     fen = extract_fen_from_state(state, prompt_messages)
-    prompt_tokens, completion_tokens, completion_logprobs = _extract_single_turn_tokens(
-        state=state,
-        strict_single_turn=strict_single_turn,
-    )
+    try:
+        prompt_tokens, completion_tokens, completion_logprobs = _extract_single_turn_tokens(
+            state=state,
+            strict_single_turn=strict_single_turn,
+        )
+        response_text = tokenizer.decode(completion_tokens, skip_special_tokens=True)
+    except MultiTurnStateError:
+        raise
+    except ValueError:
+        completion_text = _extract_completion_text(state)
+        if completion_text is None:
+            raise
+        prompt_tokens = renderer.build_generation_prompt(prompt_messages).to_ints()
+        completion_tokens = tokenizer.encode(completion_text, add_special_tokens=False)
+        completion_logprobs = []
+        response_text = completion_text
+
     reward = float(state.get("reward") or 0.0)
     feedback_text = extract_feedback_text(state, feedback_keys)
     expected_answer = _extract_expected_answer_text(state)
-    response_text = tokenizer.decode(completion_tokens, skip_special_tokens=True)
 
     return RolloutSample(
         prompt_messages=prompt_messages,
@@ -713,9 +851,25 @@ async def _compute_sample_advantages(
     max_reprompt_tokens: int,
     reprompt_truncation: Literal["left", "right", "error"],
     semaphore: asyncio.Semaphore | None,
-) -> tuple[list[float], int, int]:
+) -> tuple[list[float], int, int, list[float]]:
+    rollout_logprobs = list(sample.completion_logprobs)
+    if len(rollout_logprobs) != len(sample.completion_tokens):
+        original_sequence_tokens = sample.prompt_tokens + sample.completion_tokens
+        original_input = tinker.ModelInput.from_ints(original_sequence_tokens)
+        full_rollout_logprobs = await _maybe_compute_logprobs_with_semaphore(
+            sampling_client=current_sampling_client,
+            model_input=original_input,
+            semaphore=semaphore,
+        )
+        rollout_logprobs = _extract_completion_logprobs_from_full_sequence(
+            logprobs=full_rollout_logprobs,
+            prompt_len=len(sample.prompt_tokens),
+            completion_len=len(sample.completion_tokens),
+            sequence_label="rollout",
+        )
+
     if not used_reprompt:
-        return [0.0] * len(sample.completion_tokens), 0, 0
+        return [0.0] * len(sample.completion_tokens), 0, 0, rollout_logprobs
 
     teacher_prompt_tokens = renderer.build_generation_prompt(teacher_messages).to_ints()
     teacher_prompt_tokens = _truncate_teacher_prompt_tokens(
@@ -892,10 +1046,10 @@ async def _compute_sample_advantages(
                     )
                 ]
 
-    rollout_tensor = torch.tensor(sample.completion_logprobs, dtype=torch.float32)
+    rollout_tensor = torch.tensor(rollout_logprobs, dtype=torch.float32)
     if not full_logit_distillation:
         advantages_tensor = teacher_tensor - rollout_tensor
-        return advantages_tensor.tolist(), 0, 0
+        return advantages_tensor.tolist(), 0, 0, rollout_logprobs
 
     assert distillation_topk is not None
     assert teacher_completion_topk is not None
@@ -930,7 +1084,7 @@ async def _compute_sample_advantages(
         else:
             advantages.append(float(topk_advantage))
 
-    return advantages, topk_overlap_count, topk_total_count
+    return advantages, topk_overlap_count, topk_total_count, rollout_logprobs
 
 
 async def build_group_sdpo_datums(
@@ -953,10 +1107,12 @@ async def build_group_sdpo_datums(
     stats = GroupSdpoStats()
 
     for state in states:
+        _accumulate_numeric_env_metrics(stats, state.get("metrics"))
         try:
             sample = _extract_rollout_sample(
                 state=state,
                 feedback_keys=feedback_keys,
+                renderer=renderer,
                 tokenizer=tokenizer,
                 strict_single_turn=config.strict_single_turn,
             )
@@ -994,6 +1150,7 @@ async def build_group_sdpo_datums(
                 bool,
                 bool,
                 bool,
+                bool,
                 int,
                 int,
             ]
@@ -1003,6 +1160,9 @@ async def build_group_sdpo_datums(
     hint_task_by_fen: dict[str, asyncio.Task[str]] = {}
     hint_task_by_idx: list[asyncio.Task[str] | None] = [None] * len(records)
     verification_task_by_idx: list[asyncio.Task[Any | None] | None] = [None] * len(records)
+    shared_stockfish_task_by_idx: list[asyncio.Task[tuple[str, Any | None]] | None] = [None] * len(
+        records
+    )
     verification_candidate_by_idx: list[bool] = [False] * len(records)
     verification_scheduled_by_idx: list[bool] = [False] * len(records)
 
@@ -1024,6 +1184,7 @@ async def build_group_sdpo_datums(
                 fen=sample.fen,
                 predicted_text=sample.response_text,
                 depth=config.stockfish_verification_depth,
+                multipv=config.stockfish_verification_multipv,
                 illegal_move_cp_loss=config.stockfish_illegal_move_cp_loss,
             )
         except Exception as exc:
@@ -1033,6 +1194,29 @@ async def build_group_sdpo_datums(
                 exc,
             )
             return None
+
+    async def _run_shared_stockfish_task(sample: RolloutSample) -> tuple[str, Any | None]:
+        try:
+            if stockfish_hint_extractor is None or sample.fen is None:
+                return "", None
+            return await _stockfish_analyze_and_verify_async(
+                stockfish_client=stockfish_hint_extractor,
+                fen=sample.fen,
+                predicted_text=sample.response_text,
+                hint_depth=config.stockfish_depth,
+                hint_multipv=config.stockfish_multipv,
+                verification_depth=config.stockfish_verification_depth,
+                verification_multipv=config.stockfish_verification_multipv,
+                illegal_move_cp_loss=config.stockfish_illegal_move_cp_loss,
+                mode=config.stockfish_shared_eval_mode,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed shared Stockfish analyze+verify for FEN %s: %s",
+                sample.fen,
+                exc,
+            )
+            return "", None
 
     for i, sample in enumerate(records):
         solution_idx = select_solution_idx(
@@ -1055,18 +1239,10 @@ async def build_group_sdpo_datums(
             and sample.fen is not None
             and (not config.stockfish_hints_only_without_solution or not bool(solution_text))
         )
-        if should_use_hints and sample.fen is not None:
-            hint_task = hint_task_by_fen.get(sample.fen)
-            if hint_task is None:
-                hint_task = asyncio.create_task(_run_stockfish_hint_task(sample.fen))
-                hint_task_by_fen[sample.fen] = hint_task
-            hint_task_by_idx[i] = hint_task
-
         stockfish_verification_candidate = (
-            config.enable_stockfish_hints
+            config.enable_stockfish_move_verification
             and stockfish_hint_extractor is not None
             and sample.fen is not None
-            and config.enable_stockfish_move_verification
         )
         stockfish_verification_scheduled = (
             stockfish_verification_candidate
@@ -1077,6 +1253,26 @@ async def build_group_sdpo_datums(
         )
         verification_candidate_by_idx[i] = stockfish_verification_candidate
         verification_scheduled_by_idx[i] = stockfish_verification_scheduled
+        should_share_stockfish_eval = (
+            should_use_hints
+            and stockfish_verification_scheduled
+            and config.stockfish_shared_hint_and_verification_eval
+        )
+
+        if should_share_stockfish_eval:
+            shared_stockfish_task_by_idx[i] = asyncio.create_task(
+                _run_shared_stockfish_task(sample)
+            )
+        elif should_use_hints and sample.fen is not None:
+            hint_task = hint_task_by_fen.get(sample.fen)
+            if hint_task is None:
+                hint_task = asyncio.create_task(_run_stockfish_hint_task(sample.fen))
+                hint_task_by_fen[sample.fen] = hint_task
+            hint_task_by_idx[i] = hint_task
+
+        if should_share_stockfish_eval:
+            continue
+
         if stockfish_verification_scheduled:
             verification_task_by_idx[i] = asyncio.create_task(
                 _run_stockfish_verification_task(sample)
@@ -1090,15 +1286,26 @@ async def build_group_sdpo_datums(
     verification_tasks = [task for task in verification_task_by_idx if task is not None]
     if verification_tasks:
         await asyncio.gather(*verification_tasks)
+    shared_stockfish_tasks = [task for task in shared_stockfish_task_by_idx if task is not None]
+    if shared_stockfish_tasks:
+        await asyncio.gather(*shared_stockfish_tasks)
 
     for i, sample in enumerate(records):
         solution_text = solution_texts[i]
         stockfish_hints_text = None
+        shared_task = shared_stockfish_task_by_idx[i]
+        shared_verification: Any | None = None
+        if shared_task is not None:
+            shared_hint_text, shared_verification = shared_task.result()
+            if shared_hint_text:
+                stockfish_hints_text = shared_hint_text
         hint_task = hint_task_by_idx[i]
-        if hint_task is not None:
+        if hint_task is not None and stockfish_hints_text is None:
             hint_text = hint_task.result()
             if hint_text:
                 stockfish_hints_text = hint_text
+        if sample.fen is not None and stockfish_hints_text:
+            stockfish_hints_by_fen[sample.fen] = stockfish_hints_text
 
         stockfish_hint_used = (
             config.enable_stockfish_hints
@@ -1114,11 +1321,36 @@ async def build_group_sdpo_datums(
         stockfish_feedback_used = False
         stockfish_best_move_uci: str | None = None
         stockfish_predicted_move_uci: str | None = None
+        stockfish_best_move_match = False
         stockfish_verification_candidate = verification_candidate_by_idx[i]
         stockfish_verification_scheduled = verification_scheduled_by_idx[i]
         verification_task = verification_task_by_idx[i]
         verification_obj: Any | None = None
-        if verification_task is not None:
+        if shared_verification is not None:
+            verification_obj = shared_verification
+            stockfish_verified = True
+            stockfish_move_is_legal = shared_verification.move_is_legal
+            stockfish_cp_loss = float(shared_verification.cp_loss)
+            stockfish_cp_loss_estimated = shared_verification.cp_loss_source != "centipawn"
+            stockfish_best_move_uci = getattr(shared_verification, "best_move_uci", None)
+            stockfish_predicted_move_uci = getattr(shared_verification, "predicted_move_uci", None)
+            should_add_stockfish_feedback = (
+                config.include_stockfish_move_feedback
+                and stockfish_cp_loss >= config.stockfish_feedback_cp_loss_threshold
+            )
+            if should_add_stockfish_feedback:
+                if combined_feedback_text:
+                    combined_feedback_text = (
+                        f"{combined_feedback_text}\n\n{shared_verification.feedback_text}"
+                    )
+                else:
+                    combined_feedback_text = shared_verification.feedback_text
+                stockfish_feedback_used = True
+            if stockfish_best_move_uci and stockfish_predicted_move_uci:
+                stockfish_best_move_match = (
+                    stockfish_predicted_move_uci == stockfish_best_move_uci
+                )
+        elif verification_task is not None:
             verification = verification_task.result()
             if verification is not None:
                 verification_obj = verification
@@ -1140,6 +1372,10 @@ async def build_group_sdpo_datums(
                     else:
                         combined_feedback_text = verification.feedback_text
                     stockfish_feedback_used = True
+                if stockfish_best_move_uci and stockfish_predicted_move_uci:
+                    stockfish_best_move_match = (
+                        stockfish_predicted_move_uci == stockfish_best_move_uci
+                    )
 
         teacher_messages, feedback_used, used_reprompt = build_teacher_messages(
             prompt_messages=sample.prompt_messages,
@@ -1200,6 +1436,7 @@ async def build_group_sdpo_datums(
                     "stockfish_predicted_move": stockfish_predicted_move_uci,
                     "stockfish_best_move": stockfish_best_move_uci,
                     "stockfish_move_is_legal": bool(stockfish_move_is_legal),
+                    "stockfish_best_move_match": bool(stockfish_best_move_match),
                     "stockfish_cp_loss": float(stockfish_cp_loss),
                     "stockfish_cp_loss_estimated": bool(stockfish_cp_loss_estimated),
                     "stockfish_feedback_text": _truncate_debug_text(
@@ -1218,13 +1455,30 @@ async def build_group_sdpo_datums(
             local_stockfish_hint_used: bool = stockfish_hint_used,
             local_stockfish_verified: bool = stockfish_verified,
             local_stockfish_move_is_legal: bool = stockfish_move_is_legal,
+            local_stockfish_best_move_match: bool = stockfish_best_move_match,
             local_stockfish_cp_loss: float = stockfish_cp_loss,
             local_stockfish_cp_loss_estimated: bool = stockfish_cp_loss_estimated,
             local_stockfish_feedback_used: bool = stockfish_feedback_used,
             local_stockfish_verification_candidate: bool = stockfish_verification_candidate,
             local_stockfish_verification_scheduled: bool = stockfish_verification_scheduled,
-        ) -> tuple[tinker.Datum, list[float], bool, bool, bool, bool, bool, float, bool, bool, bool, int, int]:
-            advantages, topk_overlap_count, topk_total_count = await _compute_sample_advantages(
+        ) -> tuple[
+            tinker.Datum,
+            list[float],
+            bool,
+            bool,
+            bool,
+            bool,
+            bool,
+            bool,
+            float,
+            bool,
+            bool,
+            bool,
+            bool,
+            int,
+            int,
+        ]:
+            advantages, topk_overlap_count, topk_total_count, rollout_logprobs = await _compute_sample_advantages(
                 sample=rollout_sample,
                 teacher_messages=local_teacher_messages,
                 used_reprompt=local_used_reprompt,
@@ -1252,7 +1506,7 @@ async def build_group_sdpo_datums(
             datum = build_sdpo_datum(
                 prompt_tokens=rollout_sample.prompt_tokens,
                 completion_tokens=rollout_sample.completion_tokens,
-                rollout_logprobs=rollout_sample.completion_logprobs,
+                rollout_logprobs=rollout_logprobs,
                 advantages=advantages,
             )
             return (
@@ -1263,6 +1517,7 @@ async def build_group_sdpo_datums(
                 local_stockfish_hint_used,
                 local_stockfish_verified,
                 local_stockfish_move_is_legal,
+                local_stockfish_best_move_match,
                 local_stockfish_cp_loss,
                 local_stockfish_cp_loss_estimated,
                 local_stockfish_feedback_used,
@@ -1284,6 +1539,7 @@ async def build_group_sdpo_datums(
             stockfish_hint_used,
             stockfish_verified,
             stockfish_move_is_legal,
+            stockfish_best_move_match,
             stockfish_cp_loss,
             stockfish_cp_loss_estimated,
             stockfish_feedback_used,
@@ -1305,6 +1561,8 @@ async def build_group_sdpo_datums(
         if stockfish_verified:
             stats.stockfish_verified_samples += 1
             stats.stockfish_cp_loss_sum += stockfish_cp_loss
+            if stockfish_best_move_match:
+                stats.stockfish_best_move_samples += 1
             if stockfish_cp_loss_estimated:
                 stats.stockfish_estimated_cp_loss_samples += 1
         if stockfish_move_is_legal:
@@ -1352,8 +1610,11 @@ async def run_sdpo_batch_update(
 ) -> dict[str, Any]:
     if not 0.0 <= config.grpo_mix_lambda <= 1.0:
         raise ValueError(f"grpo_mix_lambda must be in [0, 1], got {config.grpo_mix_lambda}")
-    if config.updates_per_batch <= 0:
-        raise ValueError(f"updates_per_batch must be >= 1, got {config.updates_per_batch}")
+    if config.updates_per_batch != 1:
+        raise ValueError(
+            "SDPO training is on-policy only; updates_per_batch must be exactly 1 "
+            f"(got {config.updates_per_batch})"
+        )
     if config.teacher_regularization == "ema" and not 0.0 < config.teacher_mix_alpha <= 1.0:
         raise ValueError(
             f"teacher_mix_alpha must be in (0, 1] for ema regularization, got {config.teacher_mix_alpha}"
@@ -1362,6 +1623,16 @@ async def run_sdpo_batch_update(
         raise ValueError(
             "stockfish_verification_sample_rate must be in [0, 1], got "
             f"{config.stockfish_verification_sample_rate}"
+        )
+    if config.stockfish_verification_multipv <= 0:
+        raise ValueError(
+            "stockfish_verification_multipv must be >= 1, got "
+            f"{config.stockfish_verification_multipv}"
+        )
+    if config.stockfish_shared_eval_mode not in {"single", "two_pass"}:
+        raise ValueError(
+            "stockfish_shared_eval_mode must be 'single' or 'two_pass', got "
+            f"{config.stockfish_shared_eval_mode}"
         )
     if debug_examples_limit < 0:
         raise ValueError(f"debug_examples_limit must be >= 0, got {debug_examples_limit}")
@@ -1412,6 +1683,7 @@ async def run_sdpo_batch_update(
         )
         total_stats.stockfish_verified_samples += group_stats.stockfish_verified_samples
         total_stats.stockfish_legal_move_samples += group_stats.stockfish_legal_move_samples
+        total_stats.stockfish_best_move_samples += group_stats.stockfish_best_move_samples
         total_stats.stockfish_cp_loss_sum += group_stats.stockfish_cp_loss_sum
         total_stats.stockfish_estimated_cp_loss_samples += (
             group_stats.stockfish_estimated_cp_loss_samples
@@ -1425,6 +1697,10 @@ async def run_sdpo_batch_update(
         total_stats.advantage_count += group_stats.advantage_count
         total_stats.topk_overlap_count += group_stats.topk_overlap_count
         total_stats.topk_total_count += group_stats.topk_total_count
+        for key, value in group_stats.env_metric_sums.items():
+            total_stats.env_metric_sums[key] = total_stats.env_metric_sums.get(key, 0.0) + value
+        for key, value in group_stats.env_metric_counts.items():
+            total_stats.env_metric_counts[key] = total_stats.env_metric_counts.get(key, 0) + value
 
     metrics: dict[str, Any] = {
         "sdpo/num_datums": len(all_data),
@@ -1439,6 +1715,13 @@ async def run_sdpo_batch_update(
         "sdpo/stockfish_move_verification_enabled": float(config.enable_stockfish_move_verification),
         "sdpo/stockfish_verification_sample_rate": float(config.stockfish_verification_sample_rate),
         "sdpo/stockfish_verification_depth": float(config.stockfish_verification_depth),
+        "sdpo/stockfish_verification_multipv": float(config.stockfish_verification_multipv),
+        "sdpo/stockfish_shared_eval_enabled": float(
+            config.stockfish_shared_hint_and_verification_eval
+        ),
+        "sdpo/stockfish_shared_eval_mode_two_pass": float(
+            config.stockfish_shared_eval_mode == "two_pass"
+        ),
     }
 
     if len(states_by_group) > 0:
@@ -1472,6 +1755,9 @@ async def run_sdpo_batch_update(
         metrics["sdpo/stockfish_legal_move_fraction"] = (
             total_stats.stockfish_legal_move_samples / total_stats.num_samples
         )
+        metrics["sdpo/stockfish_best_move_fraction"] = (
+            total_stats.stockfish_best_move_samples / total_stats.num_samples
+        )
         metrics["sdpo/stockfish_feedback_fraction"] = (
             total_stats.stockfish_feedback_samples / total_stats.num_samples
         )
@@ -1489,6 +1775,7 @@ async def run_sdpo_batch_update(
         metrics["sdpo/stockfish_verification_scheduled_fraction"] = 0.0
         metrics["sdpo/stockfish_verified_fraction"] = 0.0
         metrics["sdpo/stockfish_legal_move_fraction"] = 0.0
+        metrics["sdpo/stockfish_best_move_fraction"] = 0.0
         metrics["sdpo/stockfish_feedback_fraction"] = 0.0
         metrics["sdpo/stockfish_estimated_cp_loss_fraction"] = 0.0
         metrics["sdpo/reprompt_sample_fraction"] = 0.0
@@ -1498,8 +1785,15 @@ async def run_sdpo_batch_update(
         metrics["sdpo/stockfish_avg_cp_loss"] = (
             total_stats.stockfish_cp_loss_sum / total_stats.stockfish_verified_samples
         )
+        metrics["sdpo/stockfish_accuracy"] = (
+            total_stats.stockfish_best_move_samples / total_stats.stockfish_verified_samples
+        )
     else:
         metrics["sdpo/stockfish_avg_cp_loss"] = 0.0
+        metrics["sdpo/stockfish_accuracy"] = 0.0
+    metrics["sdpo/stockfish_acpl"] = metrics["sdpo/stockfish_avg_cp_loss"]
+    metrics["chess/acc"] = metrics["sdpo/stockfish_accuracy"]
+    metrics["chess/acpl"] = metrics["sdpo/stockfish_acpl"]
 
     if total_stats.advantage_count > 0:
         metrics["sdpo/mean_advantage"] = total_stats.advantage_sum / total_stats.advantage_count
@@ -1514,21 +1808,24 @@ async def run_sdpo_batch_update(
     else:
         metrics["sdpo/topk_overlap_fraction"] = 0.0
 
+    for key, total_value in sorted(total_stats.env_metric_sums.items()):
+        count = total_stats.env_metric_counts.get(key, 0)
+        if count > 0:
+            metrics[f"env/{key}"] = total_value / count
+
     if all_data:
         with timed("train", metrics):
-            for i_update in range(config.updates_per_batch):
-                update_metrics: dict[str, Any] = {}
-                _ = await rl_train.train_step(
-                    data_D=all_data,
-                    training_client=training_client,
-                    learning_rate=config.learning_rate,
-                    num_substeps=config.num_substeps,
-                    loss_fn=config.loss_fn,
-                    loss_fn_config=config.loss_fn_config,
-                    metrics=update_metrics,
-                )
-                if i_update == config.updates_per_batch - 1:
-                    metrics.update(update_metrics)
+            update_metrics: dict[str, Any] = {}
+            _ = await rl_train.train_step(
+                data_D=all_data,
+                training_client=training_client,
+                learning_rate=config.learning_rate,
+                num_substeps=config.num_substeps,
+                loss_fn=config.loss_fn,
+                loss_fn_config=config.loss_fn_config,
+                metrics=update_metrics,
+            )
+            metrics.update(update_metrics)
 
     return metrics
 
@@ -1554,8 +1851,16 @@ async def _run_verifiers_group_rollout(
     from tinker_cookbook.recipes.verifiers_rl.tinker_openai import TinkerAsyncOpenAIClient
 
     rollout_inputs = builder.get_rollout_inputs(group_size)
-    gen_sem = asyncio.Semaphore(max_concurrent_generation) if max_concurrent_generation > 0 else None
-    score_sem = asyncio.Semaphore(max_concurrent_scoring) if max_concurrent_scoring > 0 else None
+    # Some verifiers versions expect semaphores (not None) for run_group.
+    # For non-positive limits, default to group_size-bound concurrency.
+    effective_max_concurrent_generation = (
+        max_concurrent_generation if max_concurrent_generation > 0 else group_size
+    )
+    effective_max_concurrent_scoring = (
+        max_concurrent_scoring if max_concurrent_scoring > 0 else group_size
+    )
+    gen_sem = asyncio.Semaphore(max(1, effective_max_concurrent_generation))
+    score_sem = asyncio.Semaphore(max(1, effective_max_concurrent_scoring))
 
     client = TinkerAsyncOpenAIClient(sampling_client, renderer, tokenizer)
     gen_sampling_args: dict[str, Any] = {
@@ -1565,14 +1870,28 @@ async def _run_verifiers_group_rollout(
     if student_max_thinking_tokens > 0:
         gen_sampling_args["max_thinking_tokens"] = student_max_thinking_tokens
 
-    states = await builder.vf_env.run_group(
-        group_inputs=rollout_inputs,
-        client=client,
-        model="tinker",
-        gen_sampling_args=gen_sampling_args,
-        gen_sem=gen_sem,
-        score_sem=score_sem,
+    run_group_fn = builder.vf_env.run_group
+    run_group_sig = inspect.signature(run_group_fn)
+    run_group_params = run_group_sig.parameters
+    accepts_var_kwargs = any(
+        param.kind == inspect.Parameter.VAR_KEYWORD for param in run_group_params.values()
     )
+
+    run_group_kwargs: dict[str, Any] = {
+        "group_inputs": rollout_inputs,
+        "client": client,
+        "model": "tinker",
+    }
+    if "gen_sem" in run_group_params or accepts_var_kwargs:
+        run_group_kwargs["gen_sem"] = gen_sem
+    if "score_sem" in run_group_params or accepts_var_kwargs:
+        run_group_kwargs["score_sem"] = score_sem
+    if "gen_sampling_args" in run_group_params or accepts_var_kwargs:
+        run_group_kwargs["gen_sampling_args"] = gen_sampling_args
+    if "sampling_args" in run_group_params or accepts_var_kwargs:
+        run_group_kwargs["sampling_args"] = gen_sampling_args
+
+    states = await run_group_fn(**run_group_kwargs)
 
     if not isinstance(states, list):
         raise ValueError("vf_env.run_group did not return a list of states")
@@ -1632,6 +1951,16 @@ async def main(config: Config):
         )
     if config.stockfish_num_workers <= 0:
         raise ValueError(f"stockfish_num_workers must be >= 1, got {config.stockfish_num_workers}")
+    if config.stockfish_verification_multipv <= 0:
+        raise ValueError(
+            "stockfish_verification_multipv must be >= 1, got "
+            f"{config.stockfish_verification_multipv}"
+        )
+    if config.stockfish_shared_eval_mode not in {"single", "two_pass"}:
+        raise ValueError(
+            "stockfish_shared_eval_mode must be 'single' or 'two_pass', got "
+            f"{config.stockfish_shared_eval_mode}"
+        )
     if config.student_max_thinking_tokens < 0:
         raise ValueError(
             "student_max_thinking_tokens must be >= 0, got "
@@ -1650,6 +1979,11 @@ async def main(config: Config):
         )
     if not config.debug_examples_file_name.strip():
         raise ValueError("debug_examples_file_name must be non-empty")
+    if config.updates_per_batch != 1:
+        raise ValueError(
+            "SDPO training is on-policy only; updates_per_batch must be exactly 1 "
+            f"(got {config.updates_per_batch})"
+        )
 
     ml_logger = ml_log.setup_logging(
         log_dir=config.log_path,
@@ -1699,8 +2033,14 @@ async def main(config: Config):
         maxlen=max(1, config.ema_teacher_history)
     )
     stockfish_hint_extractor: Any | None = None
+    persistent_stockfish_cache_dir = config.stockfish_persistent_cache_dir
+    enable_stockfish_service = (
+        config.enable_stockfish_hints or config.enable_stockfish_move_verification
+    )
+    if enable_stockfish_service and persistent_stockfish_cache_dir is None:
+        persistent_stockfish_cache_dir = os.path.join(config.log_path, "stockfish_cache")
     try:
-        if config.enable_stockfish_hints:
+        if enable_stockfish_service:
             stockfish_hint_config = StockfishHintConfig(
                 stockfish_path=config.stockfish_path,
                 depth=config.stockfish_depth,
@@ -1725,17 +2065,35 @@ async def main(config: Config):
                 syzygy_path=config.stockfish_syzygy_path,
                 syzygy_max_pieces=config.stockfish_syzygy_max_pieces,
                 unknown_score_cp_loss=config.stockfish_unknown_score_cp_loss,
+                persistent_cache_dir=persistent_stockfish_cache_dir,
             )
             stockfish_hint_extractor = StockfishHintPool(
                 stockfish_hint_config,
                 num_workers=config.stockfish_num_workers,
             )
-            logger.info(
-                "Stockfish hints enabled via %s (%d worker(s), %d thread(s) per worker)",
-                config.stockfish_path,
-                config.stockfish_num_workers,
-                config.stockfish_threads,
-            )
+            if config.enable_stockfish_hints and config.enable_stockfish_move_verification:
+                logger.info(
+                    "Stockfish hints and move verification enabled via %s "
+                    "(%d worker(s), %d thread(s) per worker)",
+                    config.stockfish_path,
+                    config.stockfish_num_workers,
+                    config.stockfish_threads,
+                )
+            elif config.enable_stockfish_hints:
+                logger.info(
+                    "Stockfish hints enabled via %s (%d worker(s), %d thread(s) per worker)",
+                    config.stockfish_path,
+                    config.stockfish_num_workers,
+                    config.stockfish_threads,
+                )
+            else:
+                logger.info(
+                    "Stockfish move verification enabled via %s "
+                    "(%d worker(s), %d thread(s) per worker)",
+                    config.stockfish_path,
+                    config.stockfish_num_workers,
+                    config.stockfish_threads,
+                )
 
         for i_batch in range(start_batch, num_batches):
             metrics: dict[str, Any] = {
@@ -1845,4 +2203,16 @@ async def main(config: Config):
     finally:
         if stockfish_hint_extractor is not None:
             stockfish_hint_extractor.close()
+        try:
+            from tinker_cookbook.recipes.verifiers_rl.verifiers_env import get_vf_env
+        except Exception:
+            get_vf_env = None
+        if get_vf_env is not None:
+            try:
+                vf_env = get_vf_env()
+                teardown = getattr(vf_env, "_teardown", None) if vf_env is not None else None
+                if callable(teardown):
+                    await teardown()
+            except Exception as exc:
+                logger.warning("Failed to teardown verifiers environment: %s", exc)
         ml_logger.close()

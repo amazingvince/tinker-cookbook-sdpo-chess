@@ -100,6 +100,7 @@ class CLIConfig:
     stockfish_max_weak_square_items: int = 8
     stockfish_syzygy_path: str | None = None
     stockfish_syzygy_max_pieces: int = 5
+    stockfish_persistent_cache_dir: str | None = None
     stockfish_unknown_score_cp_loss: float = 80.0
     stockfish_hints_template: str = (
         "\nTeacher-only analysis notes (private, do not reference explicitly):\n\n"
@@ -109,6 +110,9 @@ class CLIConfig:
     enable_stockfish_move_verification: bool = True
     stockfish_verification_sample_rate: float = 1.0
     stockfish_verification_depth: int = 20
+    stockfish_verification_multipv: int = 1
+    stockfish_shared_hint_and_verification_eval: bool = True
+    stockfish_shared_eval_mode: Literal["single", "two_pass"] = "two_pass"
     stockfish_illegal_move_cp_loss: float = 1000.0
     include_stockfish_move_feedback: bool = True
     stockfish_feedback_cp_loss_threshold: float = 0.0
@@ -216,12 +220,18 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
         stockfish_max_weak_square_items=cli_config.stockfish_max_weak_square_items,
         stockfish_syzygy_path=cli_config.stockfish_syzygy_path,
         stockfish_syzygy_max_pieces=cli_config.stockfish_syzygy_max_pieces,
+        stockfish_persistent_cache_dir=cli_config.stockfish_persistent_cache_dir,
         stockfish_unknown_score_cp_loss=cli_config.stockfish_unknown_score_cp_loss,
         stockfish_hints_template=cli_config.stockfish_hints_template,
         stockfish_hints_only_without_solution=cli_config.stockfish_hints_only_without_solution,
         enable_stockfish_move_verification=cli_config.enable_stockfish_move_verification,
         stockfish_verification_sample_rate=cli_config.stockfish_verification_sample_rate,
         stockfish_verification_depth=cli_config.stockfish_verification_depth,
+        stockfish_verification_multipv=cli_config.stockfish_verification_multipv,
+        stockfish_shared_hint_and_verification_eval=(
+            cli_config.stockfish_shared_hint_and_verification_eval
+        ),
+        stockfish_shared_eval_mode=cli_config.stockfish_shared_eval_mode,
         stockfish_illegal_move_cp_loss=cli_config.stockfish_illegal_move_cp_loss,
         include_stockfish_move_feedback=cli_config.include_stockfish_move_feedback,
         stockfish_feedback_cp_loss_threshold=cli_config.stockfish_feedback_cp_loss_threshold,

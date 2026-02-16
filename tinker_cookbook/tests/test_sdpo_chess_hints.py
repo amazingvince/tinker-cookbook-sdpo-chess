@@ -10,6 +10,7 @@ from tinker_cookbook.sdpo.chess_hints import (  # noqa: E402
     MoveHint,
     PositionHintPack,
     StockfishHintConfig,
+    StockfishHintExtractor,
     ThreatSummary,
     _compute_cp_loss,
     build_stockfish_hint_text_for_state,
@@ -126,6 +127,9 @@ def test_render_hint_text_includes_good_and_bad_move_sections():
     assert "Weak king-zone squares" in text
     assert "Top candidate moves by expected score:" in text
     assert "Moves likely to be bad:" in text
+    assert "Trap analysis (future-state refutations):" in text
+    assert "refutation:" in text
+    assert "motifs:" in text
     assert "cp=+35.0" in text
     assert "hangs moved piece" in text
 
@@ -236,6 +240,40 @@ def test_pick_random_game_fen_returns_valid_fen():
     assert fen is not None
     board = chess.Board(fen)
     assert board.is_valid()
+
+
+def test_persistent_cache_key_prefix_changes_with_semantic_config():
+    base_cfg = StockfishHintConfig(
+        stockfish_path="/tmp/stockfish-a",
+        wdl_model="sf",
+        max_pv_plies=6,
+        syzygy_path="/tmp/syzygy",
+        syzygy_max_pieces=5,
+        unknown_score_cp_loss=80.0,
+    )
+    same_cfg = StockfishHintConfig(
+        stockfish_path="/tmp/stockfish-a",
+        wdl_model="sf",
+        max_pv_plies=6,
+        syzygy_path="/tmp/syzygy",
+        syzygy_max_pieces=5,
+        unknown_score_cp_loss=80.0,
+    )
+    changed_cfg = StockfishHintConfig(
+        stockfish_path="/tmp/stockfish-a",
+        wdl_model="lichess",
+        max_pv_plies=6,
+        syzygy_path="/tmp/syzygy",
+        syzygy_max_pieces=5,
+        unknown_score_cp_loss=80.0,
+    )
+
+    base_prefix = StockfishHintExtractor._build_persistent_key_prefix(base_cfg)
+    same_prefix = StockfishHintExtractor._build_persistent_key_prefix(same_cfg)
+    changed_prefix = StockfishHintExtractor._build_persistent_key_prefix(changed_cfg)
+
+    assert base_prefix == same_prefix
+    assert base_prefix != changed_prefix
 
 
 def test_build_stockfish_hint_text_for_state_without_extractor():

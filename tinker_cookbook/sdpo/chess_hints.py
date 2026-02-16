@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
+import json
 import logging
 import os
+import pickle
 import queue
 import random
 import re
+import sqlite3
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from collections import OrderedDict
@@ -123,6 +129,7 @@ class StockfishHintConfig:
     max_root_cache_entries: int = 8192
     max_move_cache_entries: int = 32768
     max_verification_cache_entries: int = 65536
+    persistent_cache_dir: str | None = None
 
 
 @dataclass(frozen=True)
@@ -142,6 +149,14 @@ class MoveVerification:
     best_expected_score: float | None
     predicted_pv_san: tuple[str, ...]
     best_pv_san: tuple[str, ...]
+    predicted_search_depth: int | None
+    predicted_selective_depth: int | None
+    predicted_nodes: int | None
+    predicted_nps: int | None
+    best_search_depth: int | None
+    best_selective_depth: int | None
+    best_nodes: int | None
+    best_nps: int | None
     syzygy_root_wdl: int | None
     syzygy_root_dtz: int | None
     syzygy_predicted_wdl: int | None
@@ -675,6 +690,61 @@ def _extract_move_hint_from_info(
     )
 
 
+def _trap_severity_label(delta_expected_score: float) -> str:
+    if delta_expected_score >= 0.30:
+        return "critical"
+    if delta_expected_score >= 0.18:
+        return "major"
+    if delta_expected_score >= 0.10:
+        return "moderate"
+    return "minor"
+
+
+def _trap_motifs(move: MoveHint) -> tuple[str, ...]:
+    motifs: list[str] = []
+    refutation_tail = move.pv_san[1:]
+    if move.hangs_moved_piece:
+        motifs.append("material drop")
+    if any(("+" in san or "#" in san) for san in refutation_tail):
+        motifs.append("king safety tactic")
+    if any("x" in san for san in refutation_tail):
+        motifs.append("tactical capture sequence")
+    if move.gives_check and move.delta_expected_score >= 0.10:
+        motifs.append("unsound checking idea")
+    if move.is_promotion and move.delta_expected_score >= 0.10:
+        motifs.append("premature promotion race")
+    if not motifs and move.refutation_san:
+        motifs.append("concrete refutation line")
+    if not motifs:
+        motifs.append("strategic deterioration")
+    return tuple(motifs)
+
+
+def _render_trap_analysis_lines(
+    pack: PositionHintPack,
+    config: StockfishHintConfig,
+) -> list[str]:
+    trap_threshold = max(float(config.bad_move_threshold), 0.05)
+    trap_candidates = [
+        move for move in pack.candidate_moves if move.delta_expected_score >= trap_threshold
+    ]
+    if not trap_candidates:
+        return []
+
+    lines = ["Trap analysis (future-state refutations):"]
+    for move in trap_candidates[: config.max_bad_moves]:
+        severity = _trap_severity_label(move.delta_expected_score)
+        refutation_tail = move.pv_san[1:5]
+        refutation_text = " ".join(refutation_tail) if refutation_tail else "n/a"
+        motifs_text = ", ".join(_trap_motifs(move))
+        lines.append(
+            f"- {move.uci} ({move.san}) [{severity}] "
+            f"delta_E={move.delta_expected_score:+.3f}; "
+            f"refutation: {refutation_text}; motifs: {motifs_text}"
+        )
+    return lines
+
+
 def render_hint_text(pack: PositionHintPack, config: StockfishHintConfig) -> str:
     side = "white" if pack.side_to_move == "w" else "black"
     lines: list[str] = [
@@ -764,10 +834,15 @@ def render_hint_text(pack: PositionHintPack, config: StockfishHintConfig) -> str
             f"- {move.uci} ({move.san}): delta_E={move.delta_expected_score:+.3f}; {reason_text}"
         )
 
+    lines.extend(_render_trap_analysis_lines(pack, config))
+
     return "\n".join(lines).strip()
 
 
 class StockfishHintExtractor:
+    _PERSISTENT_ROOT_TABLE = "root_pack"
+    _PERSISTENT_VERIFICATION_TABLE = "verification"
+
     def __init__(self, config: StockfishHintConfig):
         if chess is None:
             raise ImportError(
@@ -775,16 +850,22 @@ class StockfishHintExtractor:
                 "Install `python-chess` to enable enable_stockfish_hints."
             )
         self.config = config
+        self._persistent_key_prefix = self._build_persistent_key_prefix(config)
         self._engine = self._create_engine()
         self._root_analysis_cache: OrderedDict[
             tuple[str, int, int], list[Mapping[str, Any]]
+        ] = OrderedDict()
+        self._position_hint_cache: OrderedDict[
+            tuple[str, int, int], PositionHintPack
         ] = OrderedDict()
         self._move_analysis_cache: OrderedDict[
             tuple[str, int, str], Mapping[str, Any]
         ] = OrderedDict()
         self._verification_cache: OrderedDict[
-            tuple[str, int, str | None, float], MoveVerification
+            tuple[str, int, int, str | None, float], MoveVerification
         ] = OrderedDict()
+        self._persistent_cache_lock = threading.Lock()
+        self._persistent_cache_conn = self._open_persistent_cache(config.persistent_cache_dir)
         self._tablebase: Any | None = None
         self._configure_engine()
         self._tablebase = self._open_tablebase(config.syzygy_path)
@@ -818,9 +899,124 @@ class StockfishHintExtractor:
 
     def close(self) -> None:
         self._engine.quit()
+        if self._persistent_cache_conn is not None:
+            try:
+                self._persistent_cache_conn.close()
+            except Exception:
+                pass
+            self._persistent_cache_conn = None
         if self._tablebase is not None:
             self._tablebase.close()
             self._tablebase = None
+
+    @staticmethod
+    def _build_persistent_key_prefix(config: StockfishHintConfig) -> str:
+        cache_signature = {
+            "schema": 2,
+            "stockfish_path": config.stockfish_path,
+            "wdl_model": config.wdl_model,
+            "max_pv_plies": int(config.max_pv_plies),
+            "unknown_score_cp_loss": float(config.unknown_score_cp_loss),
+            "syzygy_path": config.syzygy_path or "",
+            "syzygy_max_pieces": int(config.syzygy_max_pieces),
+            "analysis_time_limit_sec": (
+                None if config.analysis_time_limit_sec is None else float(config.analysis_time_limit_sec)
+            ),
+        }
+        serialized = json.dumps(cache_signature, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16]
+        return f"v2:{digest}"
+
+    def _root_persistent_key(self, fen: str, depth: int, multipv: int) -> str:
+        return f"{self._persistent_key_prefix}|{fen}|d={int(depth)}|m={int(multipv)}"
+
+    def _verification_persistent_key(
+        self,
+        fen: str,
+        depth: int,
+        multipv: int,
+        predicted_move_uci: str | None,
+        illegal_move_cp_loss: float,
+    ) -> str:
+        return (
+            f"{self._persistent_key_prefix}|{fen}|d={int(depth)}|m={int(multipv)}|p={predicted_move_uci or ''}"
+            f"|ill={float(illegal_move_cp_loss):.3f}"
+        )
+
+    def _open_persistent_cache(self, cache_dir: str | None) -> sqlite3.Connection | None:
+        if not cache_dir:
+            return None
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+            db_path = os.path.join(cache_dir, "stockfish_cache.sqlite3")
+            conn = sqlite3.connect(db_path, check_same_thread=False)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS root_pack (
+                    cache_key TEXT PRIMARY KEY,
+                    payload BLOB NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS verification (
+                    cache_key TEXT PRIMARY KEY,
+                    payload BLOB NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+                """
+            )
+            conn.commit()
+            logger.info("Enabled persistent Stockfish cache at %s", db_path)
+            return conn
+        except Exception as exc:
+            logger.warning("Failed to open persistent Stockfish cache at %s: %s", cache_dir, exc)
+            return None
+
+    def _persistent_cache_get(self, table_name: str, cache_key: str) -> Any | None:
+        if self._persistent_cache_conn is None:
+            return None
+        if table_name not in {self._PERSISTENT_ROOT_TABLE, self._PERSISTENT_VERIFICATION_TABLE}:
+            return None
+        try:
+            with self._persistent_cache_lock:
+                row = self._persistent_cache_conn.execute(
+                    f"SELECT payload FROM {table_name} WHERE cache_key=?",
+                    (cache_key,),
+                ).fetchone()
+            if row is None:
+                return None
+            payload = row[0]
+            if not isinstance(payload, bytes):
+                return None
+            return pickle.loads(payload)
+        except Exception:
+            return None
+
+    def _persistent_cache_set(self, table_name: str, cache_key: str, value: Any) -> None:
+        if self._persistent_cache_conn is None:
+            return
+        if table_name not in {self._PERSISTENT_ROOT_TABLE, self._PERSISTENT_VERIFICATION_TABLE}:
+            return
+        try:
+            payload = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+            with self._persistent_cache_lock:
+                self._persistent_cache_conn.execute(
+                    (
+                        f"INSERT INTO {table_name} (cache_key, payload, updated_at) "
+                        "VALUES (?, ?, ?) "
+                        "ON CONFLICT(cache_key) DO UPDATE SET "
+                        "payload=excluded.payload, updated_at=excluded.updated_at"
+                    ),
+                    (cache_key, payload, float(time.time())),
+                )
+                self._persistent_cache_conn.commit()
+        except Exception:
+            return
 
     @staticmethod
     def _split_syzygy_paths(path_value: str) -> list[str]:
@@ -988,9 +1184,26 @@ class StockfishHintExtractor:
         if chess is None:
             raise RuntimeError("python-chess is required for Stockfish hint extraction")
         board = chess.Board(fen)
-        analysis_depth = depth if depth is not None else self.config.depth
-        analysis_multipv = multipv if multipv is not None else self.config.multipv
-        infos = self._analyze_root_infos(board, depth=analysis_depth, multipv=max(1, analysis_multipv))
+        analysis_depth = int(depth) if depth is not None else int(self.config.depth)
+        analysis_multipv = max(1, int(multipv)) if multipv is not None else max(1, int(self.config.multipv))
+        pack_cache_key = (fen, analysis_depth, analysis_multipv)
+        cached_pack = self._cache_get(self._position_hint_cache, pack_cache_key)
+        if cached_pack is not None:
+            return cached_pack
+        persistent_pack = self._persistent_cache_get(
+            self._PERSISTENT_ROOT_TABLE,
+            self._root_persistent_key(fen, analysis_depth, analysis_multipv),
+        )
+        if isinstance(persistent_pack, PositionHintPack):
+            self._cache_set(
+                self._position_hint_cache,
+                pack_cache_key,
+                persistent_pack,
+                max_entries=self.config.max_root_cache_entries,
+            )
+            return persistent_pack
+
+        infos = self._analyze_root_infos(board, depth=analysis_depth, multipv=analysis_multipv)
 
         move_hints: list[MoveHint] = []
         for info in infos:
@@ -1038,7 +1251,7 @@ class StockfishHintExtractor:
 
         syzygy_root_wdl, syzygy_root_dtz = self._probe_syzygy(board)
 
-        return PositionHintPack(
+        pack = PositionHintPack(
             fen=fen,
             side_to_move="w" if board.turn == chess.WHITE else "b",
             root_wdl=root_score,
@@ -1053,6 +1266,18 @@ class StockfishHintExtractor:
             syzygy_root_wdl=syzygy_root_wdl,
             syzygy_root_dtz=syzygy_root_dtz,
         )
+        self._cache_set(
+            self._position_hint_cache,
+            pack_cache_key,
+            pack,
+            max_entries=self.config.max_root_cache_entries,
+        )
+        self._persistent_cache_set(
+            self._PERSISTENT_ROOT_TABLE,
+            self._root_persistent_key(fen, analysis_depth, analysis_multipv),
+            pack,
+        )
+        return pack
 
     def analyze_and_render(
         self,
@@ -1147,6 +1372,7 @@ class StockfishHintExtractor:
         predicted_text: str,
         depth: int = 20,
         illegal_move_cp_loss: float = 1000.0,
+        verification_multipv: int | None = None,
     ) -> MoveVerification:
         if chess is None:
             raise RuntimeError("python-chess is required for Stockfish hint extraction")
@@ -1154,15 +1380,45 @@ class StockfishHintExtractor:
         board = chess.Board(fen)
         predicted_move = extract_predicted_move(board, predicted_text)
         predicted_move_key = predicted_move.uci() if predicted_move is not None else None
-        cache_key = (fen, depth, predicted_move_key, float(illegal_move_cp_loss))
+        analysis_multipv = (
+            max(1, int(verification_multipv))
+            if verification_multipv is not None
+            else max(self.config.multipv, 8)
+        )
+        cache_key = (
+            fen,
+            depth,
+            analysis_multipv,
+            predicted_move_key,
+            float(illegal_move_cp_loss),
+        )
         cached = self._cache_get(self._verification_cache, cache_key)
         if cached is not None:
             return cached
+        persistent_key = self._verification_persistent_key(
+            fen=fen,
+            depth=depth,
+            multipv=analysis_multipv,
+            predicted_move_uci=predicted_move_key,
+            illegal_move_cp_loss=float(illegal_move_cp_loss),
+        )
+        persistent_cached = self._persistent_cache_get(
+            self._PERSISTENT_VERIFICATION_TABLE,
+            persistent_key,
+        )
+        if isinstance(persistent_cached, MoveVerification):
+            self._cache_set(
+                self._verification_cache,
+                cache_key,
+                persistent_cached,
+                max_entries=self.config.max_verification_cache_entries,
+            )
+            return persistent_cached
 
         pack = self.analyze_fen(
             fen=fen,
             depth=depth,
-            multipv=max(self.config.multipv, 8),
+            multipv=analysis_multipv,
         )
         best_move = pack.candidate_moves[0] if pack.candidate_moves else None
 
@@ -1171,6 +1427,10 @@ class StockfishHintExtractor:
         best_cp = best_move.centipawn_score if best_move else None
         best_expected = best_move.expected_score if best_move else None
         best_pv = best_move.pv_san if best_move else ()
+        best_depth = best_move.search_depth if best_move else None
+        best_seldepth = best_move.selective_depth if best_move else None
+        best_nodes = best_move.nodes if best_move else None
+        best_nps = best_move.nps if best_move else None
         syzygy_root_wdl, syzygy_root_dtz = self._probe_syzygy(board)
 
         syzygy_best_wdl: int | None = None
@@ -1202,6 +1462,14 @@ class StockfishHintExtractor:
                 best_expected_score=best_expected,
                 predicted_pv_san=(),
                 best_pv_san=best_pv,
+                predicted_search_depth=None,
+                predicted_selective_depth=None,
+                predicted_nodes=None,
+                predicted_nps=None,
+                best_search_depth=best_depth,
+                best_selective_depth=best_seldepth,
+                best_nodes=best_nodes,
+                best_nps=best_nps,
                 syzygy_root_wdl=syzygy_root_wdl,
                 syzygy_root_dtz=syzygy_root_dtz,
                 syzygy_predicted_wdl=None,
@@ -1219,6 +1487,11 @@ class StockfishHintExtractor:
                 cache_key,
                 result,
                 max_entries=self.config.max_verification_cache_entries,
+            )
+            self._persistent_cache_set(
+                self._PERSISTENT_VERIFICATION_TABLE,
+                persistent_key,
+                result,
             )
             return result
 
@@ -1240,6 +1513,12 @@ class StockfishHintExtractor:
                 if predicted_info is not None
                 else None
             )
+            predicted_depth = _to_optional_int(predicted_info.get("depth")) if predicted_info else None
+            predicted_seldepth = (
+                _to_optional_int(predicted_info.get("seldepth")) if predicted_info else None
+            )
+            predicted_nodes = _to_optional_int(predicted_info.get("nodes")) if predicted_info else None
+            predicted_nps = _to_optional_int(predicted_info.get("nps")) if predicted_info else None
             if predicted_info is not None and isinstance(predicted_info.get("pv"), list):
                 predicted_pv = _pv_to_san(board, predicted_info["pv"], self.config.max_pv_plies)
             else:
@@ -1248,6 +1527,10 @@ class StockfishHintExtractor:
             predicted_expected = predicted_hint.expected_score
             predicted_cp = predicted_hint.centipawn_score
             predicted_pv = predicted_hint.pv_san
+            predicted_depth = predicted_hint.search_depth
+            predicted_seldepth = predicted_hint.selective_depth
+            predicted_nodes = predicted_hint.nodes
+            predicted_nps = predicted_hint.nps
 
         cp_loss, cp_loss_source = _compute_cp_loss(
             best_cp=best_cp,
@@ -1279,6 +1562,14 @@ class StockfishHintExtractor:
             best_expected_score=best_expected,
             predicted_pv_san=predicted_pv,
             best_pv_san=best_pv,
+            predicted_search_depth=predicted_depth,
+            predicted_selective_depth=predicted_seldepth,
+            predicted_nodes=predicted_nodes,
+            predicted_nps=predicted_nps,
+            best_search_depth=best_depth,
+            best_selective_depth=best_seldepth,
+            best_nodes=best_nodes,
+            best_nps=best_nps,
             syzygy_root_wdl=syzygy_root_wdl,
             syzygy_root_dtz=syzygy_root_dtz,
             syzygy_predicted_wdl=syzygy_predicted_wdl,
@@ -1297,7 +1588,76 @@ class StockfishHintExtractor:
             result,
             max_entries=self.config.max_verification_cache_entries,
         )
+        self._persistent_cache_set(
+            self._PERSISTENT_VERIFICATION_TABLE,
+            persistent_key,
+            result,
+        )
         return result
+
+    def analyze_and_verify(
+        self,
+        fen: str,
+        predicted_text: str,
+        *,
+        hint_depth: int | None = None,
+        hint_multipv: int | None = None,
+        verification_depth: int = 20,
+        verification_multipv: int | None = None,
+        illegal_move_cp_loss: float = 1000.0,
+        mode: str = "two_pass",
+    ) -> tuple[str, MoveVerification]:
+        mode_normalized = mode.strip().lower()
+        if mode_normalized not in {"single", "two_pass"}:
+            raise ValueError(
+                "mode must be 'single' or 'two_pass', "
+                f"got {mode}"
+            )
+
+        hint_depth_eff = int(hint_depth) if hint_depth is not None else int(self.config.depth)
+        hint_multipv_eff = (
+            max(1, int(hint_multipv))
+            if hint_multipv is not None
+            else max(1, int(self.config.multipv))
+        )
+        verification_depth_eff = int(verification_depth)
+        verification_multipv_eff = (
+            max(1, int(verification_multipv))
+            if verification_multipv is not None
+            else max(1, max(int(self.config.multipv), 8))
+        )
+
+        if mode_normalized == "single":
+            hint_pack = self.analyze_fen(
+                fen=fen,
+                depth=verification_depth_eff,
+                multipv=verification_multipv_eff,
+            )
+        else:
+            hint_pack = self.analyze_fen(
+                fen=fen,
+                depth=hint_depth_eff,
+                multipv=hint_multipv_eff,
+            )
+            if (
+                verification_depth_eff != hint_depth_eff
+                or verification_multipv_eff != hint_multipv_eff
+            ):
+                # Warm deep cache once so verification can reuse it without another engine call.
+                self.analyze_fen(
+                    fen=fen,
+                    depth=verification_depth_eff,
+                    multipv=verification_multipv_eff,
+                )
+
+        verification = self.verify_predicted_move(
+            fen=fen,
+            predicted_text=predicted_text,
+            depth=verification_depth_eff,
+            illegal_move_cp_loss=illegal_move_cp_loss,
+            verification_multipv=verification_multipv_eff,
+        )
+        return render_hint_text(hint_pack, self.config), verification
 
 
 class StockfishHintPool:
@@ -1360,6 +1720,7 @@ class StockfishHintPool:
         predicted_text: str,
         depth: int = 20,
         illegal_move_cp_loss: float = 1000.0,
+        verification_multipv: int | None = None,
     ) -> MoveVerification:
         return await self._run_async(
             "verify_predicted_move",
@@ -1367,6 +1728,31 @@ class StockfishHintPool:
             predicted_text,
             depth=depth,
             illegal_move_cp_loss=illegal_move_cp_loss,
+            verification_multipv=verification_multipv,
+        )
+
+    async def analyze_and_verify_async(
+        self,
+        fen: str,
+        predicted_text: str,
+        *,
+        hint_depth: int | None = None,
+        hint_multipv: int | None = None,
+        verification_depth: int = 20,
+        verification_multipv: int | None = None,
+        illegal_move_cp_loss: float = 1000.0,
+        mode: str = "two_pass",
+    ) -> tuple[str, MoveVerification]:
+        return await self._run_async(
+            "analyze_and_verify",
+            fen,
+            predicted_text,
+            hint_depth=hint_depth,
+            hint_multipv=hint_multipv,
+            verification_depth=verification_depth,
+            verification_multipv=verification_multipv,
+            illegal_move_cp_loss=illegal_move_cp_loss,
+            mode=mode,
         )
 
     def close(self) -> None:

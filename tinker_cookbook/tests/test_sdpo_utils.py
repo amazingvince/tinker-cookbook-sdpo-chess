@@ -401,6 +401,37 @@ def test_zero_advantage_when_no_reprompt_source():
     asyncio.run(_inner())
 
 
+def test_extract_rollout_sample_raises_on_multi_turn_when_strict():
+    state = {
+        "prompt": [{"role": "user", "content": "Solve the task"}],
+        "completion": [{"role": "assistant", "content": "fallback text"}],
+        "trajectory": [
+            {
+                "tokens": {
+                    "prompt_ids": [1, 2],
+                    "completion_ids": [3],
+                    "completion_logprobs": [-1.0],
+                }
+            },
+            {
+                "tokens": {
+                    "prompt_ids": [1, 2, 3],
+                    "completion_ids": [4],
+                    "completion_logprobs": [-1.1],
+                }
+            },
+        ],
+    }
+    with pytest.raises(sdpo_train.MultiTurnStateError):
+        sdpo_train._extract_rollout_sample(
+            state=state,
+            feedback_keys=["feedback"],
+            renderer=_FakeRenderer(),
+            tokenizer=_FakeTokenizer(),
+            strict_single_turn=True,
+        )
+
+
 def test_truncate_teacher_prompt_tokens_modes():
     tokens = [1, 2, 3, 4, 5]
     assert sdpo_train._truncate_teacher_prompt_tokens(tokens, 0, "right") == tokens
@@ -737,6 +768,99 @@ def test_stockfish_hint_metrics(monkeypatch):
     asyncio.run(_inner())
 
 
+def test_stockfish_verification_runs_when_hints_disabled(monkeypatch):
+    class _FakeStockfishVerifier:
+        def __init__(self):
+            self.verify_calls = 0
+
+        def verify_predicted_move(
+            self,
+            fen: str,
+            predicted_text: str,
+            depth: int = 20,
+            illegal_move_cp_loss: float = 1000.0,
+        ) -> Any:
+            _ = (fen, predicted_text, depth, illegal_move_cp_loss)
+            self.verify_calls += 1
+            return SimpleNamespace(
+                move_is_legal=True,
+                cp_loss=15.0,
+                cp_loss_source="centipawn",
+                predicted_move_uci="e2e4",
+                best_move_uci="e2e4",
+                feedback_text="",
+            )
+
+    async def fake_train_step(
+        data_D: list[sdpo_train.tinker.Datum],
+        training_client: Any,
+        learning_rate: float,
+        num_substeps: int,
+        loss_fn: str,
+        loss_fn_config: dict[str, Any] | None = None,
+        metrics: dict[str, Any] | None = None,
+    ):
+        _ = (
+            data_D,
+            training_client,
+            learning_rate,
+            num_substeps,
+            loss_fn,
+            loss_fn_config,
+            metrics,
+        )
+        return []
+
+    monkeypatch.setattr(sdpo_train.rl_train, "train_step", fake_train_step)
+
+    async def _inner():
+        verifier = _FakeStockfishVerifier()
+        config = _make_config(
+            teacher_regularization="none",
+            enable_stockfish_hints=False,
+            enable_stockfish_move_verification=True,
+            include_stockfish_move_feedback=False,
+            stockfish_verification_sample_rate=1.0,
+        )
+        state = _make_state(
+            prompt_messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        "FEN: rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+                    ),
+                }
+            ],
+            prompt_ids=[10, 11],
+            completion_ids=[12, 13],
+            completion_logprobs=[-1.2, -1.1],
+            reward=0.0,
+            feedback_text=None,
+        )
+
+        metrics = await sdpo_train.run_sdpo_batch_update(
+            config=config,
+            training_client=object(),
+            current_sampling_client=_FakeSamplingClient(base_logprob=-0.2),
+            reference_sampling_client=None,
+            ema_teacher_sampling_clients=None,
+            renderer=_FakeRenderer(),
+            tokenizer=_FakeTokenizer(),
+            states_by_group=[[state]],
+            stockfish_hint_extractor=verifier,
+        )
+        assert verifier.verify_calls == 1
+        assert metrics["sdpo/stockfish_hints_enabled"] == 0.0
+        assert metrics["sdpo/stockfish_hint_available_fraction"] == 0.0
+        assert metrics["sdpo/stockfish_hint_used_fraction"] == 0.0
+        assert metrics["sdpo/stockfish_verification_candidate_fraction"] == 1.0
+        assert metrics["sdpo/stockfish_verification_scheduled_fraction"] == 1.0
+        assert metrics["sdpo/stockfish_verified_fraction"] == 1.0
+        assert metrics["sdpo/stockfish_avg_cp_loss"] == 15.0
+
+    asyncio.run(_inner())
+
+
 def test_topk_tail_advantage_matches_manual_computation():
     student_topk = [(10, math.log(0.6)), (11, math.log(0.3))]
     teacher_topk = [(10, math.log(0.5)), (11, math.log(0.2))]
@@ -811,7 +935,53 @@ def test_full_logit_distillation_topk_path(monkeypatch):
     asyncio.run(_inner())
 
 
-def test_updates_per_batch_and_loss_fn(monkeypatch):
+def test_on_policy_only_rejects_updates_per_batch_gt_one(monkeypatch):
+    async def fake_train_step(
+        data_D: list[sdpo_train.tinker.Datum],
+        training_client: Any,
+        learning_rate: float,
+        num_substeps: int,
+        loss_fn: str,
+        loss_fn_config: dict[str, Any] | None = None,
+        metrics: dict[str, Any] | None = None,
+    ):
+        _ = (data_D, training_client, learning_rate, num_substeps, loss_fn, loss_fn_config, metrics)
+        return []
+
+    monkeypatch.setattr(sdpo_train.rl_train, "train_step", fake_train_step)
+
+    async def _inner():
+        config = _make_config(
+            teacher_regularization="none",
+            updates_per_batch=2,
+            loss_fn="ppo",
+            loss_fn_config={"clip_low_threshold": 0.9, "clip_high_threshold": 1.1},
+        )
+        state = _make_state(
+            prompt_messages=[{"role": "user", "content": "Task"}],
+            prompt_ids=[1, 2],
+            completion_ids=[3, 4],
+            completion_logprobs=[-1.0, -1.0],
+            reward=1.0,
+            feedback_text=None,
+        )
+        with pytest.raises(ValueError, match="on-policy only"):
+            await sdpo_train.run_sdpo_batch_update(
+                config=config,
+                training_client=object(),
+                current_sampling_client=_FakeSamplingClient(base_logprob=-0.2),
+                reference_sampling_client=None,
+                ema_teacher_sampling_clients=None,
+                renderer=_FakeRenderer(),
+                tokenizer=_FakeTokenizer(),
+                states_by_group=[[state]],
+                stockfish_hint_extractor=None,
+            )
+
+    asyncio.run(_inner())
+
+
+def test_updates_per_batch_one_still_forwards_loss_fn(monkeypatch):
     calls: list[tuple[str, dict[str, Any] | None]] = []
 
     async def fake_train_step(
@@ -832,7 +1002,7 @@ def test_updates_per_batch_and_loss_fn(monkeypatch):
     async def _inner():
         config = _make_config(
             teacher_regularization="none",
-            updates_per_batch=3,
+            updates_per_batch=1,
             loss_fn="ppo",
             loss_fn_config={"clip_low_threshold": 0.9, "clip_high_threshold": 1.1},
         )
@@ -864,10 +1034,10 @@ def test_updates_per_batch_and_loss_fn(monkeypatch):
             states_by_group=[[success_state, failed_state]],
             stockfish_hint_extractor=None,
         )
-        assert metrics["sdpo/updates_per_batch"] == 3.0
+        assert metrics["sdpo/updates_per_batch"] == 1.0
 
     asyncio.run(_inner())
-    assert len(calls) == 3
+    assert len(calls) == 1
     assert all(call[0] == "ppo" for call in calls)
     assert all(call[1] == {"clip_low_threshold": 0.9, "clip_high_threshold": 1.1} for call in calls)
 
