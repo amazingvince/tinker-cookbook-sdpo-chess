@@ -21,7 +21,7 @@ from tinker_cookbook.rl import train as rl_train
 from tinker_cookbook.rl.types import RLDatasetBuilder
 from tinker_cookbook.sdpo.chess_hints import (
     StockfishHintConfig,
-    StockfishHintExtractor,
+    StockfishHintPool,
     extract_fen_from_state,
 )
 from tinker_cookbook.sdpo.utils import (
@@ -131,6 +131,7 @@ class Config:
     stockfish_path: str = "stockfish"
     stockfish_depth: int = 14
     stockfish_multipv: int = 5
+    stockfish_num_workers: int = 1
     stockfish_threads: int = 1
     stockfish_hash_mb: int = 128
     stockfish_wdl_model: str = "sf"
@@ -192,6 +193,40 @@ def _should_run_stockfish_verification(
         return False
     key = f"{sample.fen or ''}|{sample.response_text}"
     return _hash_to_unit_interval(key) < sample_rate
+
+
+async def _stockfish_analyze_and_render_async(
+    stockfish_client: Any,
+    fen: str,
+) -> str:
+    analyze_async = getattr(stockfish_client, "analyze_and_render_async", None)
+    if callable(analyze_async):
+        return await analyze_async(fen)
+    return await asyncio.to_thread(stockfish_client.analyze_and_render, fen)
+
+
+async def _stockfish_verify_predicted_move_async(
+    stockfish_client: Any,
+    fen: str,
+    predicted_text: str,
+    depth: int,
+    illegal_move_cp_loss: float,
+) -> Any:
+    verify_async = getattr(stockfish_client, "verify_predicted_move_async", None)
+    if callable(verify_async):
+        return await verify_async(
+            fen=fen,
+            predicted_text=predicted_text,
+            depth=depth,
+            illegal_move_cp_loss=illegal_move_cp_loss,
+        )
+    return await asyncio.to_thread(
+        stockfish_client.verify_predicted_move,
+        fen,
+        predicted_text,
+        depth,
+        illegal_move_cp_loss,
+    )
 
 
 def _normalize_prompt_messages(prompt_value: Any) -> list[renderers.Message]:
@@ -759,7 +794,7 @@ async def build_group_sdpo_datums(
     tokenizer: Tokenizer,
     feedback_keys: Sequence[str],
     teacher_logprob_semaphore: asyncio.Semaphore | None,
-    stockfish_hint_extractor: StockfishHintExtractor | None,
+    stockfish_hint_extractor: Any | None,
 ) -> tuple[list[tinker.Datum], GroupSdpoStats]:
     records: list[RolloutSample] = []
     stats = GroupSdpoStats()
@@ -811,6 +846,40 @@ async def build_group_sdpo_datums(
             ]
         ]
     ] = []
+    solution_texts: list[str | None] = [None] * len(records)
+    hint_task_by_fen: dict[str, asyncio.Task[str]] = {}
+    hint_task_by_idx: list[asyncio.Task[str] | None] = [None] * len(records)
+    verification_task_by_idx: list[asyncio.Task[Any | None] | None] = [None] * len(records)
+    verification_candidate_by_idx: list[bool] = [False] * len(records)
+    verification_scheduled_by_idx: list[bool] = [False] * len(records)
+
+    async def _run_stockfish_hint_task(fen: str) -> str:
+        try:
+            if stockfish_hint_extractor is None:
+                return ""
+            return await _stockfish_analyze_and_render_async(stockfish_hint_extractor, fen)
+        except Exception as exc:
+            logger.warning("Failed to build Stockfish hints for FEN %s: %s", fen, exc)
+            return ""
+
+    async def _run_stockfish_verification_task(sample: RolloutSample) -> Any | None:
+        try:
+            if stockfish_hint_extractor is None or sample.fen is None:
+                return None
+            return await _stockfish_verify_predicted_move_async(
+                stockfish_client=stockfish_hint_extractor,
+                fen=sample.fen,
+                predicted_text=sample.response_text,
+                depth=config.stockfish_verification_depth,
+                illegal_move_cp_loss=config.stockfish_illegal_move_cp_loss,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed Stockfish move verification for FEN %s: %s",
+                sample.fen,
+                exc,
+            )
+            return None
 
     for i, sample in enumerate(records):
         solution_idx = select_solution_idx(
@@ -825,38 +894,21 @@ async def build_group_sdpo_datums(
             solution_text = records[solution_idx].response_text
             if config.remove_thinking_from_demonstration:
                 solution_text = maybe_strip_thinking(solution_text)
+        solution_texts[i] = solution_text
 
-        stockfish_hints_text: str | None = None
-        if (
+        should_use_hints = (
             config.enable_stockfish_hints
             and stockfish_hint_extractor is not None
             and sample.fen is not None
             and (not config.stockfish_hints_only_without_solution or not bool(solution_text))
-        ):
-            if sample.fen not in stockfish_hints_by_fen:
-                try:
-                    stockfish_hints_by_fen[sample.fen] = stockfish_hint_extractor.analyze_and_render(
-                        sample.fen
-                    )
-                except Exception as exc:
-                    logger.warning("Failed to build Stockfish hints for FEN %s: %s", sample.fen, exc)
-                    stockfish_hints_by_fen[sample.fen] = ""
-            cached_hints = stockfish_hints_by_fen[sample.fen]
-            if cached_hints:
-                stockfish_hints_text = cached_hints
-
-        stockfish_hint_used = (
-            config.enable_stockfish_hints
-            and stockfish_hints_text is not None
-            and (not config.stockfish_hints_only_without_solution or not bool(solution_text))
         )
+        if should_use_hints and sample.fen is not None:
+            hint_task = hint_task_by_fen.get(sample.fen)
+            if hint_task is None:
+                hint_task = asyncio.create_task(_run_stockfish_hint_task(sample.fen))
+                hint_task_by_fen[sample.fen] = hint_task
+            hint_task_by_idx[i] = hint_task
 
-        combined_feedback_text = sample.feedback_text
-        stockfish_verified = False
-        stockfish_move_is_legal = False
-        stockfish_cp_loss = 0.0
-        stockfish_cp_loss_estimated = False
-        stockfish_feedback_used = False
         stockfish_verification_candidate = (
             config.enable_stockfish_hints
             and stockfish_hint_extractor is not None
@@ -870,18 +922,49 @@ async def build_group_sdpo_datums(
                 sample_rate=config.stockfish_verification_sample_rate,
             )
         )
-        if (
-            stockfish_verification_scheduled
-            and stockfish_hint_extractor is not None
-            and sample.fen is not None
-        ):
-            try:
-                verification = stockfish_hint_extractor.verify_predicted_move(
-                    fen=sample.fen,
-                    predicted_text=sample.response_text,
-                    depth=config.stockfish_verification_depth,
-                    illegal_move_cp_loss=config.stockfish_illegal_move_cp_loss,
-                )
+        verification_candidate_by_idx[i] = stockfish_verification_candidate
+        verification_scheduled_by_idx[i] = stockfish_verification_scheduled
+        if stockfish_verification_scheduled:
+            verification_task_by_idx[i] = asyncio.create_task(
+                _run_stockfish_verification_task(sample)
+            )
+
+    if hint_task_by_fen:
+        await asyncio.gather(*hint_task_by_fen.values())
+        for fen, task in hint_task_by_fen.items():
+            stockfish_hints_by_fen[fen] = task.result()
+
+    verification_tasks = [task for task in verification_task_by_idx if task is not None]
+    if verification_tasks:
+        await asyncio.gather(*verification_tasks)
+
+    for i, sample in enumerate(records):
+        solution_text = solution_texts[i]
+        stockfish_hints_text = None
+        hint_task = hint_task_by_idx[i]
+        if hint_task is not None:
+            hint_text = hint_task.result()
+            if hint_text:
+                stockfish_hints_text = hint_text
+
+        stockfish_hint_used = (
+            config.enable_stockfish_hints
+            and stockfish_hints_text is not None
+            and (not config.stockfish_hints_only_without_solution or not bool(solution_text))
+        )
+
+        combined_feedback_text = sample.feedback_text
+        stockfish_verified = False
+        stockfish_move_is_legal = False
+        stockfish_cp_loss = 0.0
+        stockfish_cp_loss_estimated = False
+        stockfish_feedback_used = False
+        stockfish_verification_candidate = verification_candidate_by_idx[i]
+        stockfish_verification_scheduled = verification_scheduled_by_idx[i]
+        verification_task = verification_task_by_idx[i]
+        if verification_task is not None:
+            verification = verification_task.result()
+            if verification is not None:
                 stockfish_verified = True
                 stockfish_move_is_legal = verification.move_is_legal
                 stockfish_cp_loss = float(verification.cp_loss)
@@ -898,12 +981,6 @@ async def build_group_sdpo_datums(
                     else:
                         combined_feedback_text = verification.feedback_text
                     stockfish_feedback_used = True
-            except Exception as exc:
-                logger.warning(
-                    "Failed Stockfish move verification for FEN %s: %s",
-                    sample.fen,
-                    exc,
-                )
 
         teacher_messages, feedback_used, used_reprompt = build_teacher_messages(
             prompt_messages=sample.prompt_messages,
@@ -1056,7 +1133,7 @@ async def run_sdpo_batch_update(
     renderer: renderers.Renderer,
     tokenizer: Tokenizer,
     states_by_group: Sequence[Sequence[Mapping[str, Any]]],
-    stockfish_hint_extractor: StockfishHintExtractor | None,
+    stockfish_hint_extractor: Any | None,
 ) -> dict[str, Any]:
     if not 0.0 <= config.grpo_mix_lambda <= 1.0:
         raise ValueError(f"grpo_mix_lambda must be in [0, 1], got {config.grpo_mix_lambda}")
@@ -1326,6 +1403,8 @@ async def main(config: Config):
         raise ValueError(
             f"ema_teacher_history must be >= 1 when teacher_regularization='ema' (got {config.ema_teacher_history})"
         )
+    if config.stockfish_num_workers <= 0:
+        raise ValueError(f"stockfish_num_workers must be >= 1, got {config.stockfish_num_workers}")
 
     ml_logger = ml_log.setup_logging(
         log_dir=config.log_path,
@@ -1374,37 +1453,44 @@ async def main(config: Config):
     ema_teacher_clients: deque[tinker.SamplingClient] = deque(
         maxlen=max(1, config.ema_teacher_history)
     )
-    stockfish_hint_extractor: StockfishHintExtractor | None = None
+    stockfish_hint_extractor: Any | None = None
     try:
         if config.enable_stockfish_hints:
-            stockfish_hint_extractor = StockfishHintExtractor(
-                StockfishHintConfig(
-                    stockfish_path=config.stockfish_path,
-                    depth=config.stockfish_depth,
-                    multipv=config.stockfish_multipv,
-                    threads=config.stockfish_threads,
-                    hash_mb=config.stockfish_hash_mb,
-                    wdl_model=config.stockfish_wdl_model,
-                    max_pv_plies=config.stockfish_max_pv_plies,
-                    max_good_moves=config.stockfish_hint_max_good_moves,
-                    max_bad_moves=config.stockfish_hint_max_bad_moves,
-                    bad_move_threshold=config.stockfish_hint_bad_move_threshold,
-                    include_fen_decode=config.stockfish_include_fen_decode,
-                    include_ascii_board=config.stockfish_include_ascii_board,
-                    include_search_stats=config.stockfish_include_search_stats,
-                    analysis_time_limit_sec=config.stockfish_analysis_time_limit_sec,
-                    engine_max_retries=config.stockfish_engine_max_retries,
-                    max_root_cache_entries=config.stockfish_max_root_cache_entries,
-                    max_move_cache_entries=config.stockfish_max_move_cache_entries,
-                    max_verification_cache_entries=config.stockfish_max_verification_cache_entries,
-                    max_piece_pressure_items=config.stockfish_max_piece_pressure_items,
-                    max_weak_square_items=config.stockfish_max_weak_square_items,
-                    syzygy_path=config.stockfish_syzygy_path,
-                    syzygy_max_pieces=config.stockfish_syzygy_max_pieces,
-                    unknown_score_cp_loss=config.stockfish_unknown_score_cp_loss,
-                )
+            stockfish_hint_config = StockfishHintConfig(
+                stockfish_path=config.stockfish_path,
+                depth=config.stockfish_depth,
+                multipv=config.stockfish_multipv,
+                threads=config.stockfish_threads,
+                hash_mb=config.stockfish_hash_mb,
+                wdl_model=config.stockfish_wdl_model,
+                max_pv_plies=config.stockfish_max_pv_plies,
+                max_good_moves=config.stockfish_hint_max_good_moves,
+                max_bad_moves=config.stockfish_hint_max_bad_moves,
+                bad_move_threshold=config.stockfish_hint_bad_move_threshold,
+                include_fen_decode=config.stockfish_include_fen_decode,
+                include_ascii_board=config.stockfish_include_ascii_board,
+                include_search_stats=config.stockfish_include_search_stats,
+                analysis_time_limit_sec=config.stockfish_analysis_time_limit_sec,
+                engine_max_retries=config.stockfish_engine_max_retries,
+                max_root_cache_entries=config.stockfish_max_root_cache_entries,
+                max_move_cache_entries=config.stockfish_max_move_cache_entries,
+                max_verification_cache_entries=config.stockfish_max_verification_cache_entries,
+                max_piece_pressure_items=config.stockfish_max_piece_pressure_items,
+                max_weak_square_items=config.stockfish_max_weak_square_items,
+                syzygy_path=config.stockfish_syzygy_path,
+                syzygy_max_pieces=config.stockfish_syzygy_max_pieces,
+                unknown_score_cp_loss=config.stockfish_unknown_score_cp_loss,
             )
-            logger.info("Stockfish hints enabled via %s", config.stockfish_path)
+            stockfish_hint_extractor = StockfishHintPool(
+                stockfish_hint_config,
+                num_workers=config.stockfish_num_workers,
+            )
+            logger.info(
+                "Stockfish hints enabled via %s (%d worker(s), %d thread(s) per worker)",
+                config.stockfish_path,
+                config.stockfish_num_workers,
+                config.stockfish_threads,
+            )
 
         for i_batch in range(start_batch, num_batches):
             metrics: dict[str, Any] = {

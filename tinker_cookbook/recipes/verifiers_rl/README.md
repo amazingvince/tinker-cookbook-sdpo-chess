@@ -92,6 +92,8 @@ python -m tinker_cookbook.recipes.verifiers_rl.sdpo_train \
   stockfish_path=/path/to/stockfish \
   stockfish_depth=14 \
   stockfish_multipv=5 \
+  stockfish_num_workers=16 \
+  stockfish_threads=2 \
   stockfish_verification_depth=20 \
   stockfish_verification_sample_rate=1.0 \
   stockfish_analysis_time_limit_sec=0.2 \

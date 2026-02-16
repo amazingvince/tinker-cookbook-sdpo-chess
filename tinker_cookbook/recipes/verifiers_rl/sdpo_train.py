@@ -66,6 +66,7 @@ class CLIConfig:
     stockfish_path: str = "stockfish"
     stockfish_depth: int = 14
     stockfish_multipv: int = 5
+    stockfish_num_workers: int = 1
     stockfish_threads: int = 1
     stockfish_hash_mb: int = 128
     stockfish_wdl_model: str = "sf"
@@ -175,6 +176,7 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
         stockfish_path=cli_config.stockfish_path,
         stockfish_depth=cli_config.stockfish_depth,
         stockfish_multipv=cli_config.stockfish_multipv,
+        stockfish_num_workers=cli_config.stockfish_num_workers,
         stockfish_threads=cli_config.stockfish_threads,
         stockfish_hash_mb=cli_config.stockfish_hash_mb,
         stockfish_wdl_model=cli_config.stockfish_wdl_model,

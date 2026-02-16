@@ -229,6 +229,24 @@ Create panels for:
   - set `stockfish_analysis_time_limit_sec` (for example `0.1`–`0.3`) to cap slow positions;
   - keep cache limits high enough (`stockfish_max_*_cache_entries`) for your dataset reuse pattern.
 
+### High-CPU node profile (example: 180 CPU / 720GB RAM)
+
+Use many workers with low thread count per engine:
+
+```bash
+stockfish_num_workers=48 \
+stockfish_threads=3 \
+stockfish_hash_mb=2048 \
+stockfish_analysis_time_limit_sec=0.15 \
+stockfish_verification_sample_rate=0.25
+```
+
+Rationale:
+
+- `num_workers * threads` near 120-160 usually gives better throughput than one giant-threaded engine.
+- Keep 20-40 CPU cores for Python/env overhead and OS.
+- Raise `stockfish_hash_mb` only if RAM headroom remains stable under full concurrency.
+
 ## 9. Common pitfalls
 
 - `strict_single_turn=true` will fail on multi-turn traces. Flatten to one completion segment or set `strict_single_turn=false`.

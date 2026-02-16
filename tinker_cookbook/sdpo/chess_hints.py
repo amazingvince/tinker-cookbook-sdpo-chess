@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import os
+import queue
 import random
 import re
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -1296,6 +1300,88 @@ class StockfishHintExtractor:
         return result
 
 
+class StockfishHintPool:
+    """Async dispatcher over multiple persistent Stockfish extractors."""
+
+    def __init__(self, config: StockfishHintConfig, num_workers: int):
+        if num_workers <= 0:
+            raise ValueError(f"num_workers must be >= 1, got {num_workers}")
+
+        self.config = config
+        self.num_workers = int(num_workers)
+        self._workers = [StockfishHintExtractor(config) for _ in range(self.num_workers)]
+        self._available_workers: queue.Queue[int] = queue.Queue()
+        for idx in range(self.num_workers):
+            self._available_workers.put(idx)
+        self._executor = ThreadPoolExecutor(
+            max_workers=self.num_workers,
+            thread_name_prefix="stockfish_pool",
+        )
+        self._closed = False
+
+    def _run_with_worker(self, method_name: str, *args: Any, **kwargs: Any) -> Any:
+        if self._closed:
+            raise RuntimeError("StockfishHintPool is closed")
+
+        worker_idx = self._available_workers.get()
+        try:
+            worker = self._workers[worker_idx]
+            method = getattr(worker, method_name)
+            return method(*args, **kwargs)
+        finally:
+            self._available_workers.put(worker_idx)
+
+    async def _run_async(self, method_name: str, *args: Any, **kwargs: Any) -> Any:
+        if self._closed:
+            raise RuntimeError("StockfishHintPool is closed")
+
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._executor,
+            partial(self._run_with_worker, method_name, *args, **kwargs),
+        )
+
+    async def analyze_and_render_async(
+        self,
+        fen: str,
+        depth: int | None = None,
+        multipv: int | None = None,
+    ) -> str:
+        return await self._run_async(
+            "analyze_and_render",
+            fen,
+            depth=depth,
+            multipv=multipv,
+        )
+
+    async def verify_predicted_move_async(
+        self,
+        fen: str,
+        predicted_text: str,
+        depth: int = 20,
+        illegal_move_cp_loss: float = 1000.0,
+    ) -> MoveVerification:
+        return await self._run_async(
+            "verify_predicted_move",
+            fen,
+            predicted_text,
+            depth=depth,
+            illegal_move_cp_loss=illegal_move_cp_loss,
+        )
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+
+        self._executor.shutdown(wait=True, cancel_futures=False)
+        for worker in self._workers:
+            try:
+                worker.close()
+            except Exception:
+                pass
+
+
 def pick_random_game_fen(movetext: str, seed: int | None = None) -> str | None:
     if chess is None:
         raise RuntimeError("python-chess is required for chess dataset helpers")
@@ -1341,6 +1427,7 @@ __all__ = [
     "PositionHintPack",
     "StockfishHintConfig",
     "StockfishHintExtractor",
+    "StockfishHintPool",
     "ThreatSummary",
     "WdlStats",
     "build_stockfish_hint_text_for_state",
