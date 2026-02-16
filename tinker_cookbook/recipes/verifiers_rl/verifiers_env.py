@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextvars import ContextVar
+import logging
 import random
 from typing import Sequence
 
@@ -19,6 +20,7 @@ from tinker_cookbook.rl.types import (
 )
 
 _vf_env_ctx: ContextVar[vf.Environment | None] = ContextVar("vf_env", default=None)
+logger = logging.getLogger(__name__)
 
 
 def set_vf_env(env: vf.Environment) -> None:
@@ -187,9 +189,22 @@ class VerifiersRLDatasetBuilder(RLDatasetBuilder):
 
         vf_env = get_vf_env()
         if vf_env is None:
+            logger.info(
+                "verifiers_env: loading environment vf_env_id=%s",
+                self.vf_env_id,
+            )
             vf_env = vf.load_environment(self.vf_env_id, **self.vf_env_args)
             set_vf_env(vf_env)
+            logger.info("verifiers_env: environment loaded vf_env_id=%s", self.vf_env_id)
+        else:
+            logger.info("verifiers_env: reusing cached environment vf_env_id=%s", self.vf_env_id)
+        logger.info(
+            "verifiers_env: requesting dataset n=%d seed=%s",
+            self.dataset_n,
+            self.dataset_seed,
+        )
         ds = vf_env.get_dataset(n=self.dataset_n, seed=self.dataset_seed)
+        logger.info("verifiers_env: dataset ready rows=%d", len(ds))
         source_rows = [
             {
                 "prompt": ds["prompt"][i],
@@ -204,6 +219,16 @@ class VerifiersRLDatasetBuilder(RLDatasetBuilder):
             rows = source_rows[: min(self.dataset_buffer_size, len(source_rows))]
         else:
             rows = source_rows
+
+        logger.info(
+            "verifiers_env: dataset mode source_rows=%d buffer_rows=%d groups_per_batch=%d sample_with_replacement=%s num_batches=%d refresh_rows_per_batch=%d",
+            len(source_rows),
+            len(rows),
+            self.groups_per_batch,
+            self.dataset_sample_with_replacement,
+            self.dataset_num_batches,
+            self.dataset_refresh_rows_per_batch,
+        )
 
         return (
             VerifiersRLDataset(

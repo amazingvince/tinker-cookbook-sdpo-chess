@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import io
 import itertools
+import logging
 import math
 import random
 import re
@@ -28,6 +29,7 @@ except ImportError:  # pragma: no cover - guarded at runtime
 _UCI_RE = re.compile(r"\b([a-h][1-8][a-h][1-8][qrbn]?)\b", flags=re.IGNORECASE)
 _UCI_FULL_RE = re.compile(r"^[a-h][1-8][a-h][1-8][qrbn]?$", flags=re.IGNORECASE)
 _GAME_VERIFICATION_CACHE_KEY = "_hf_chess_mix_stockfish_verification"
+logger = logging.getLogger(__name__)
 
 
 def _build_stockfish_config(
@@ -432,9 +434,18 @@ def _collect_examples(
     if target_count <= 0:
         return []
 
+    logger.info(
+        "hf-chess-mix: begin streaming dataset=%s target_count=%d max_scan_rows=%d seed=%d shuffle_buffer_size=%d",
+        dataset_name,
+        target_count,
+        max_scan_rows,
+        seed,
+        shuffle_buffer_size,
+    )
     rng = random.Random(seed)
     rows: list[dict[str, Any]] = []
     scanned = 0
+    log_every = max(1000, min(50000, max_scan_rows // 20 if max_scan_rows > 0 else 10000))
     stream = _iter_dataset_rows(
         dataset_name=dataset_name,
         seed=seed,
@@ -442,7 +453,22 @@ def _collect_examples(
     )
     for row in stream:
         scanned += 1
+        if scanned % log_every == 0:
+            logger.info(
+                "hf-chess-mix: dataset=%s scanned=%d collected=%d/%d",
+                dataset_name,
+                scanned,
+                len(rows),
+                target_count,
+            )
         if scanned > max_scan_rows:
+            logger.info(
+                "hf-chess-mix: dataset=%s reached max_scan_rows=%d collected=%d/%d",
+                dataset_name,
+                max_scan_rows,
+                len(rows),
+                target_count,
+            )
             break
         if not isinstance(row, Mapping):
             continue
@@ -460,6 +486,13 @@ def _collect_examples(
         rows.extend(parsed)
         if len(rows) >= target_count:
             break
+    logger.info(
+        "hf-chess-mix: completed dataset=%s scanned=%d collected=%d/%d",
+        dataset_name,
+        scanned,
+        len(rows),
+        target_count,
+    )
     return rows
 
 
@@ -516,6 +549,14 @@ def _build_dataset(
     pool_size = max(max_examples, max_examples * oversample_factor)
     puzzle_pool_target = int(round(pool_size * puzzles_fraction))
     game_pool_target = max(0, pool_size - puzzle_pool_target)
+    logger.info(
+        "hf-chess-mix: building dataset max_examples=%d pool_size=%d puzzles_fraction=%.3f puzzle_pool_target=%d game_pool_target=%d",
+        max_examples,
+        pool_size,
+        puzzles_fraction,
+        puzzle_pool_target,
+        game_pool_target,
+    )
 
     puzzle_rows = _collect_examples(
         dataset_name=puzzles_dataset,
@@ -530,9 +571,15 @@ def _build_dataset(
             max_puzzle_solver_moves_per_puzzle=max_puzzle_solver_moves_per_puzzle,
         ),
     )
+    logger.info(
+        "hf-chess-mix: collected puzzle candidate rows=%d from %s",
+        len(puzzle_rows),
+        puzzles_dataset,
+    )
     best_move_oracle: _StockfishBestMoveOracle | None = None
     try:
         if game_answer_mode == "stockfish" and game_pool_target > 0:
+            logger.info("hf-chess-mix: initializing Stockfish best-move oracle for game labeling")
             best_move_oracle = _StockfishBestMoveOracle(stockfish_config)
 
         game_rows = _collect_examples(
@@ -552,6 +599,11 @@ def _build_dataset(
                 best_move_oracle=best_move_oracle,
             ),
         )
+        logger.info(
+            "hf-chess-mix: collected game candidate rows=%d from %s",
+            len(game_rows),
+            games_dataset,
+        )
     finally:
         if best_move_oracle is not None:
             best_move_oracle.close()
@@ -563,9 +615,11 @@ def _build_dataset(
         puzzles_fraction=puzzles_fraction,
         seed=seed,
     )
+    logger.info("hf-chess-mix: mixed final dataset rows=%d", len(mixed_rows))
     dataset = Dataset.from_list(mixed_rows)
     if shuffle:
         dataset = dataset.shuffle(seed=seed)
+    logger.info("hf-chess-mix: dataset construction complete rows=%d", len(dataset))
     return dataset
 
 
@@ -1040,6 +1094,15 @@ def load_environment(
     if chess is None:
         raise RuntimeError("python-chess is required for hf-chess-mix")
 
+    logger.info(
+        "hf-chess-mix: load_environment start max_examples=%d puzzles_fraction=%.3f game_answer_mode=%s stockfish_depth=%d stockfish_num_workers=%d",
+        max_examples,
+        puzzles_fraction,
+        game_answer_mode,
+        stockfish_depth,
+        stockfish_num_workers,
+    )
+
     if max_examples <= 0:
         raise ValueError(f"max_examples must be > 0, got {max_examples}")
     if not 0.0 <= puzzles_fraction <= 1.0:
@@ -1143,6 +1206,15 @@ def load_environment(
         stockfish_syzygy_max_pieces=stockfish_syzygy_max_pieces,
         stockfish_persistent_cache_dir=stockfish_persistent_cache_dir,
     )
+    logger.info(
+        "hf-chess-mix: stockfish config path=%s threads=%d hash_mb=%d depth=%d multipv=%d syzygy_max_pieces=%d",
+        stockfish_path,
+        stockfish_threads,
+        stockfish_hash_mb,
+        stockfish_depth,
+        stockfish_multipv,
+        stockfish_syzygy_max_pieces,
+    )
 
     dataset = _build_dataset(
         max_examples=max_examples,
@@ -1172,6 +1244,11 @@ def load_environment(
             num_workers=stockfish_num_workers,
             verification_multipv=stockfish_verification_multipv,
         )
+        logger.info(
+            "hf-chess-mix: enabled async Stockfish game verifier pool workers=%d verification_multipv=%d",
+            stockfish_num_workers,
+            stockfish_verification_multipv,
+        )
 
     rubric = ChessMoveRubric(
         game_stockfish_pool=game_stockfish_pool,
@@ -1190,6 +1267,7 @@ def load_environment(
         game_reward_confidence_nodes_reference=game_reward_confidence_nodes_reference,
         game_reward_confidence_seldepth_factor=game_reward_confidence_seldepth_factor,
     )
+    logger.info("hf-chess-mix: load_environment complete")
     return HFChessMixEnv(
         dataset=dataset,
         eval_dataset=dataset,
