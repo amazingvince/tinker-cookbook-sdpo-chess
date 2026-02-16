@@ -9,6 +9,10 @@ from typing import Any
 import pytest
 import torch
 
+from tinker_cookbook.recipes.verifiers_rl.tinker_openai import (
+    _parse_max_thinking_tokens,
+    _truncate_thinking_blocks_text,
+)
 from tinker_cookbook.sdpo import train as sdpo_train
 from tinker_cookbook.sdpo.utils import (
     build_sdpo_datum,
@@ -35,6 +39,16 @@ class _FakeRenderer:
         text = " ".join(str(m.get("content", "")) for m in messages)
         n_tokens = max(1, len(text.split()))
         return sdpo_train.tinker.ModelInput.from_ints([1000 + i for i in range(n_tokens)])
+
+
+class _CharTokenizer:
+    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+        _ = add_special_tokens
+        return [ord(ch) for ch in text]
+
+    def decode(self, token_ids: Sequence[int], skip_special_tokens: bool = True) -> str:
+        _ = skip_special_tokens
+        return "".join(chr(int(token_id)) for token_id in token_ids)
 
 
 class _FakeSamplingClient:
@@ -302,6 +316,34 @@ def test_trust_region_mix_logprob_matches_manual_logsumexp():
     assert torch.allclose(mixed, expected, atol=1e-6)
 
 
+def test_parse_max_thinking_tokens():
+    assert _parse_max_thinking_tokens(None) == 0
+    assert _parse_max_thinking_tokens("16") == 16
+    assert _parse_max_thinking_tokens(0) == 0
+    assert _parse_max_thinking_tokens(-5) == 0
+    assert _parse_max_thinking_tokens("not-an-int") == 0
+
+
+def test_truncate_thinking_blocks_text():
+    tokenizer = _CharTokenizer()
+    text = "Before <think>abcdefghij</think> After"
+    truncated, changed = _truncate_thinking_blocks_text(
+        text=text,
+        tokenizer=tokenizer,
+        max_thinking_tokens=4,
+    )
+    assert changed is True
+    assert truncated == "Before <think>abcd</think> After"
+
+    unchanged, changed = _truncate_thinking_blocks_text(
+        text=text,
+        tokenizer=tokenizer,
+        max_thinking_tokens=0,
+    )
+    assert changed is False
+    assert unchanged == text
+
+
 def test_build_sdpo_datum_alignment():
     prompt_tokens = [1, 2, 3]
     completion_tokens = [10, 11]
@@ -361,6 +403,7 @@ def test_zero_advantage_when_no_reprompt_source():
 
 def test_truncate_teacher_prompt_tokens_modes():
     tokens = [1, 2, 3, 4, 5]
+    assert sdpo_train._truncate_teacher_prompt_tokens(tokens, 0, "right") == tokens
     assert sdpo_train._truncate_teacher_prompt_tokens(tokens, 3, "right") == [1, 2, 3]
     assert sdpo_train._truncate_teacher_prompt_tokens(tokens, 3, "left") == [3, 4, 5]
     with pytest.raises(ValueError, match="reprompt_truncation='error'"):

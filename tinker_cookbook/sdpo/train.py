@@ -127,10 +127,20 @@ class Config:
     full_logit_distillation: bool = False
     distillation_topk: int | None = None
     distillation_add_tail: bool = True
-    reprompt_template: str = "{prompt}{solution}{feedback}\n\nCorrectly solve the original question.\n"
-    solution_template: str = "\nCorrect solution:\n\n{successful_previous_attempt}\n\n"
+    reprompt_template: str = (
+        "{prompt}{solution}{feedback}{hints}\n"
+        "Use the additional context above only as private guidance.\n"
+        "Now answer the original question in your own style.\n"
+        "Do not mention, quote, or allude to hints, feedback, reference solutions, Stockfish, "
+        "engines, or external tools.\n"
+    )
+    solution_template: str = (
+        "\nTeacher-only reference solution (private context):\n\n"
+        "{successful_previous_attempt}\n\n"
+    )
     feedback_template: str = (
-        "\nThe following is feedback from your unsuccessful earlier attempt:\n\n{feedback_raw}\n\n"
+        "\nTeacher-only feedback from an unsuccessful earlier attempt (private context):\n\n"
+        "{feedback_raw}\n\n"
     )
     feedback_keys_csv: str = "feedback,error,errors,judge_feedback"
     enable_stockfish_hints: bool = False
@@ -159,7 +169,8 @@ class Config:
     stockfish_syzygy_max_pieces: int = 5
     stockfish_unknown_score_cp_loss: float = 80.0
     stockfish_hints_template: str = (
-        "\nStockfish position hints (WDL expected score):\n\n{stockfish_hints}\n\n"
+        "\nTeacher-only analysis notes (private, do not reference explicitly):\n\n"
+        "{stockfish_hints}\n\n"
     )
     stockfish_hints_only_without_solution: bool = False
     enable_stockfish_move_verification: bool = True
@@ -168,10 +179,11 @@ class Config:
     stockfish_illegal_move_cp_loss: float = 1000.0
     include_stockfish_move_feedback: bool = True
     stockfish_feedback_cp_loss_threshold: float = 0.0
-    max_reprompt_tokens: int = 10240
+    max_reprompt_tokens: int = 0
     reprompt_truncation: Literal["left", "right", "error"] = "right"
     strict_single_turn: bool = True
     max_concurrent_teacher_logprobs: int = 64
+    student_max_thinking_tokens: int = 0
     grpo_mix_lambda: float = 0.0
     advantage_mode: Literal["token", "sequence"] = "token"
     updates_per_batch: int = 1
@@ -665,6 +677,10 @@ def _truncate_teacher_prompt_tokens(
     max_reprompt_tokens: int,
     truncation: Literal["left", "right", "error"],
 ) -> list[int]:
+    # max_reprompt_tokens <= 0 disables truncation entirely.
+    if max_reprompt_tokens <= 0:
+        return prompt_tokens
+
     if len(prompt_tokens) <= max_reprompt_tokens:
         return prompt_tokens
 
@@ -1418,6 +1434,7 @@ async def run_sdpo_batch_update(
         "sdpo/grpo_mix_lambda": config.grpo_mix_lambda,
         "sdpo/full_logit_distillation": float(config.full_logit_distillation),
         "sdpo/updates_per_batch": float(config.updates_per_batch),
+        "sdpo/student_max_thinking_tokens": float(config.student_max_thinking_tokens),
         "sdpo/stockfish_hints_enabled": float(config.enable_stockfish_hints),
         "sdpo/stockfish_move_verification_enabled": float(config.enable_stockfish_move_verification),
         "sdpo/stockfish_verification_sample_rate": float(config.stockfish_verification_sample_rate),
@@ -1523,6 +1540,7 @@ async def _run_verifiers_group_rollout(
     tokenizer: Tokenizer,
     group_size: int,
     max_tokens: int,
+    student_max_thinking_tokens: int,
     temperature: float,
     max_concurrent_generation: int,
     max_concurrent_scoring: int,
@@ -1540,14 +1558,18 @@ async def _run_verifiers_group_rollout(
     score_sem = asyncio.Semaphore(max_concurrent_scoring) if max_concurrent_scoring > 0 else None
 
     client = TinkerAsyncOpenAIClient(sampling_client, renderer, tokenizer)
+    gen_sampling_args: dict[str, Any] = {
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    if student_max_thinking_tokens > 0:
+        gen_sampling_args["max_thinking_tokens"] = student_max_thinking_tokens
+
     states = await builder.vf_env.run_group(
         group_inputs=rollout_inputs,
         client=client,
         model="tinker",
-        gen_sampling_args={
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-        },
+        gen_sampling_args=gen_sampling_args,
         gen_sem=gen_sem,
         score_sem=score_sem,
     )
@@ -1610,6 +1632,11 @@ async def main(config: Config):
         )
     if config.stockfish_num_workers <= 0:
         raise ValueError(f"stockfish_num_workers must be >= 1, got {config.stockfish_num_workers}")
+    if config.student_max_thinking_tokens < 0:
+        raise ValueError(
+            "student_max_thinking_tokens must be >= 0, got "
+            f"{config.student_max_thinking_tokens}"
+        )
     if config.debug_examples_every_n_steps < 0:
         raise ValueError(
             f"debug_examples_every_n_steps must be >= 0, got {config.debug_examples_every_n_steps}"
@@ -1734,6 +1761,7 @@ async def main(config: Config):
                             tokenizer=tokenizer,
                             group_size=config.group_size,
                             max_tokens=config.max_tokens,
+                            student_max_thinking_tokens=config.student_max_thinking_tokens,
                             temperature=config.temperature,
                             max_concurrent_generation=config.max_concurrent_generation,
                             max_concurrent_scoring=config.max_concurrent_scoring,

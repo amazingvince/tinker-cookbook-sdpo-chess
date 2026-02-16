@@ -120,7 +120,7 @@ Primary SDPO sources used:
 | `actor...self_distillation.include_environment_feedback` | `include_environment_feedback` | `true` or `false` |
 | `actor...self_distillation.environment_feedback_only_without_solution` | `environment_feedback_only_without_solution` | `true` |
 | `actor...self_distillation.remove_thinking_from_demonstration` | `remove_thinking_from_demonstration` | `true` |
-| `actor...self_distillation.max_reprompt_len` | `max_reprompt_tokens` | `10240` |
+| `actor...self_distillation.max_reprompt_len` | `max_reprompt_tokens` | `0` (disable truncation) |
 | `actor...self_distillation.reprompt_truncation` | `reprompt_truncation` | `right` |
 | `actor...self_distillation.full_logit_distillation` | `full_logit_distillation` | `true` |
 | `actor...self_distillation.distillation_topk` | `distillation_topk` | `20` or `100` |
@@ -133,6 +133,8 @@ Important:
 - In Tinker SDPO, `teacher_mix_alpha` is used for teacher-mixture weighting.
 - In the SDPO repo, `alpha` is KL interpolation and `teacher_update_rate` / `ema_update_rate` controls EMA update.
 - They are related but not identical; use the presets below as practical parity settings.
+- `max_reprompt_tokens=0` disables truncation so long teacher hints are preserved.
+- `student_max_thinking_tokens` bounds `<think>...</think>` token count during rollout (`0` disables).
 
 ## 5. Ready-to-run parity commands
 
@@ -159,7 +161,8 @@ python -m tinker_cookbook.recipes.verifiers_rl.sdpo_train \
   include_environment_feedback=true \
   environment_feedback_only_without_solution=true \
   remove_thinking_from_demonstration=true \
-  max_reprompt_tokens=10240 \
+  student_max_thinking_tokens=256 \
+  max_reprompt_tokens=0 \
   reprompt_truncation=right \
   updates_per_batch=1 \
   wandb_project=$WANDB_PROJECT \
@@ -190,7 +193,8 @@ python -m tinker_cookbook.recipes.verifiers_rl.sdpo_train \
   include_environment_feedback=false \
   environment_feedback_only_without_solution=true \
   remove_thinking_from_demonstration=true \
-  max_reprompt_tokens=10240 \
+  student_max_thinking_tokens=256 \
+  max_reprompt_tokens=0 \
   reprompt_truncation=right \
   updates_per_batch=1 \
   wandb_project=$WANDB_PROJECT \
@@ -209,6 +213,7 @@ stockfish_depth=14 \
 stockfish_multipv=5 \
 stockfish_verification_depth=20 \
 stockfish_verification_sample_rate=1.0 \
+student_max_thinking_tokens=256 \
 stockfish_analysis_time_limit_sec=0.2 \
 stockfish_engine_max_retries=1 \
 include_stockfish_move_feedback=true \

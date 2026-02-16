@@ -10,6 +10,7 @@ Returns OpenAI types (ChatCompletion / Completion) constructed from sampled toke
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Any, Dict, List, Literal, overload
 
@@ -24,6 +25,42 @@ from openai.types.completion import Completion
 
 from tinker_cookbook import renderers
 from tinker_cookbook.tokenizer_utils import Tokenizer
+
+_THINK_BLOCK_RE = re.compile(r"(<think>)(.*?)(</think>)", flags=re.DOTALL)
+
+
+def _parse_max_thinking_tokens(value: Any) -> int:
+    if value is None:
+        return 0
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return parsed if parsed > 0 else 0
+
+
+def _truncate_thinking_blocks_text(
+    text: str,
+    tokenizer: Tokenizer,
+    max_thinking_tokens: int,
+) -> tuple[str, bool]:
+    if max_thinking_tokens <= 0:
+        return text, False
+
+    changed = False
+
+    def _replace(match: re.Match[str]) -> str:
+        nonlocal changed
+        opening, body, closing = match.groups()
+        body_ids = tokenizer.encode(body, add_special_tokens=False)
+        if len(body_ids) <= max_thinking_tokens:
+            return match.group(0)
+        truncated_body = tokenizer.decode(body_ids[:max_thinking_tokens], skip_special_tokens=False)
+        changed = True
+        return f"{opening}{truncated_body}{closing}"
+
+    new_text = _THINK_BLOCK_RE.sub(_replace, text)
+    return new_text, changed
 
 
 class TinkerAsyncOpenAIClient(AsyncOpenAI):
@@ -79,6 +116,7 @@ class TinkerChatCompletions(OpenAIAsyncChatCompletions):
         if kwargs.get("stream", False):
             raise ValueError("stream=True not supported by TinkerAsyncOpenAIClient")
         sampling_args = {k: v for k, v in kwargs.items() if k not in ("model", "messages", "tools")}
+        max_thinking_tokens = _parse_max_thinking_tokens(sampling_args.get("max_thinking_tokens"))
 
         stop = sampling_args.get("stop", self._parent.renderer.get_stop_sequences())
         max_tokens = sampling_args.get("max_tokens") or sampling_args.get("max_completion_tokens")
@@ -100,6 +138,34 @@ class TinkerChatCompletions(OpenAIAsyncChatCompletions):
         seq = sample.sequences[0]
         completion_token_ids: List[int] = seq.tokens
         logprobs: List[float] = seq.logprobs or [0.0] * len(completion_token_ids)
+
+        if max_thinking_tokens > 0 and completion_token_ids:
+            completion_text = self._parent.tokenizer.decode(
+                completion_token_ids, skip_special_tokens=False
+            )
+            bounded_text, was_truncated = _truncate_thinking_blocks_text(
+                completion_text,
+                tokenizer=self._parent.tokenizer,
+                max_thinking_tokens=max_thinking_tokens,
+            )
+            if was_truncated:
+                bounded_token_ids = self._parent.tokenizer.encode(
+                    bounded_text, add_special_tokens=False
+                )
+                try:
+                    full_input = tinker.ModelInput.from_ints(prompt_token_ids + bounded_token_ids)
+                    full_logprobs = await self._parent.sampling_client.compute_logprobs_async(full_input)
+                    bounded_logprobs = full_logprobs[
+                        len(prompt_token_ids) : len(prompt_token_ids) + len(bounded_token_ids)
+                    ]
+                    if len(bounded_logprobs) == len(bounded_token_ids) and all(
+                        lp is not None for lp in bounded_logprobs
+                    ):
+                        completion_token_ids = bounded_token_ids
+                        logprobs = [float(lp) for lp in bounded_logprobs if lp is not None]
+                except Exception:
+                    # If recomputing logprobs fails, keep original sampled output untouched.
+                    pass
 
         assistant_message, parse_success = self._parent.renderer.parse_response(
             completion_token_ids

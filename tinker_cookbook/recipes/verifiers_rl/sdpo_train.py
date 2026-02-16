@@ -60,10 +60,20 @@ class CLIConfig:
     full_logit_distillation: bool = False
     distillation_topk: int | None = None
     distillation_add_tail: bool = True
-    reprompt_template: str = "{prompt}{solution}{feedback}\n\nCorrectly solve the original question.\n"
-    solution_template: str = "\nCorrect solution:\n\n{successful_previous_attempt}\n\n"
+    reprompt_template: str = (
+        "{prompt}{solution}{feedback}{hints}\n"
+        "Use the additional context above only as private guidance.\n"
+        "Now answer the original question in your own style.\n"
+        "Do not mention, quote, or allude to hints, feedback, reference solutions, Stockfish, "
+        "engines, or external tools.\n"
+    )
+    solution_template: str = (
+        "\nTeacher-only reference solution (private context):\n\n"
+        "{successful_previous_attempt}\n\n"
+    )
     feedback_template: str = (
-        "\nThe following is feedback from your unsuccessful earlier attempt:\n\n{feedback_raw}\n\n"
+        "\nTeacher-only feedback from an unsuccessful earlier attempt (private context):\n\n"
+        "{feedback_raw}\n\n"
     )
     feedback_keys_csv: str = "feedback,error,errors,judge_feedback"
     enable_stockfish_hints: bool = False
@@ -92,7 +102,8 @@ class CLIConfig:
     stockfish_syzygy_max_pieces: int = 5
     stockfish_unknown_score_cp_loss: float = 80.0
     stockfish_hints_template: str = (
-        "\nStockfish position hints (WDL expected score):\n\n{stockfish_hints}\n\n"
+        "\nTeacher-only analysis notes (private, do not reference explicitly):\n\n"
+        "{stockfish_hints}\n\n"
     )
     stockfish_hints_only_without_solution: bool = False
     enable_stockfish_move_verification: bool = True
@@ -101,10 +112,11 @@ class CLIConfig:
     stockfish_illegal_move_cp_loss: float = 1000.0
     include_stockfish_move_feedback: bool = True
     stockfish_feedback_cp_loss_threshold: float = 0.0
-    max_reprompt_tokens: int = 10240
+    max_reprompt_tokens: int = 0
     reprompt_truncation: Literal["left", "right", "error"] = "right"
     strict_single_turn: bool = True
     max_concurrent_teacher_logprobs: int = 64
+    student_max_thinking_tokens: int = 0
     grpo_mix_lambda: float = 0.0
     advantage_mode: Literal["token", "sequence"] = "token"
     updates_per_batch: int = 1
@@ -217,6 +229,7 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
         reprompt_truncation=cli_config.reprompt_truncation,
         strict_single_turn=cli_config.strict_single_turn,
         max_concurrent_teacher_logprobs=cli_config.max_concurrent_teacher_logprobs,
+        student_max_thinking_tokens=cli_config.student_max_thinking_tokens,
         grpo_mix_lambda=cli_config.grpo_mix_lambda,
         advantage_mode=cli_config.advantage_mode,
         updates_per_batch=cli_config.updates_per_batch,

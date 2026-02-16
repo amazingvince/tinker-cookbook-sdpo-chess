@@ -94,6 +94,7 @@ python -m tinker_cookbook.recipes.verifiers_rl.sdpo_train \
   stockfish_multipv=5 \
   stockfish_num_workers=16 \
   stockfish_threads=2 \
+  student_max_thinking_tokens=256 \
   stockfish_verification_depth=20 \
   stockfish_verification_sample_rate=1.0 \
   stockfish_analysis_time_limit_sec=0.2 \
@@ -119,6 +120,13 @@ If enabled, teacher reprompts can include:
   - model predicted move vs Stockfish best move at depth 20;
   - cp-loss with source (`centipawn`, `wdl_scaled`, or fallback penalty if score is unavailable);
   - best and predicted PV lines for concrete guidance.
+- teacher prompt context is unbounded by default (`max_reprompt_tokens=0`) so long hints are retained.
+
+`student_max_thinking_tokens` limits tokens inside `<think>...</think>` blocks during student rollout
+generation (set `0` to disable).
+
+Default teacher templates treat solution/feedback/hints as private context and explicitly instruct
+the teacher to answer as if independently derived, without referencing those auxiliary signals.
 
 Helper utilities for chess runtime setup:
 
