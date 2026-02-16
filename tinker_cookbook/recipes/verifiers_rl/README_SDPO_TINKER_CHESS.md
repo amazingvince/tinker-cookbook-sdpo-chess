@@ -1,0 +1,227 @@
+# SDPO in Tinker for Chess (with W&B and SDPO-Repo Hyperparameter Parity)
+
+This guide documents a practical end-to-end workflow for training a chess model with SDPO in `tinker-cookbook`, using:
+
+- verifiers-style RL environments,
+- Stockfish 18 hints + move verification,
+- Weights & Biases logging,
+- and hyperparameter settings mapped from the official SDPO repository.
+
+The training entrypoint is:
+
+```bash
+python -m tinker_cookbook.recipes.verifiers_rl.sdpo_train ...
+```
+
+## 1. What this implementation does
+
+The SDPO path in this repo is implemented in:
+
+- `/Users/vincent/Documents/SDPO/tinker-cookbook/tinker_cookbook/sdpo/train.py`
+- `/Users/vincent/Documents/SDPO/tinker-cookbook/tinker_cookbook/sdpo/utils.py`
+- `/Users/vincent/Documents/SDPO/tinker-cookbook/tinker_cookbook/sdpo/chess_hints.py`
+- `/Users/vincent/Documents/SDPO/tinker-cookbook/tinker_cookbook/recipes/verifiers_rl/sdpo_train.py`
+
+Core behavior:
+
+- Token-level SDPO advantages from teacher-vs-rollout logprobs.
+- On-policy rollouts by default (`updates_per_batch=1`).
+- Teacher reprompting with successful peer solutions and optional environment feedback.
+- Optional teacher regularization (`trust_region`, `ema`, `none`).
+- Optional full-logit distillation (`distillation_topk` + tail).
+- Optional Stockfish hints and depth-20 verification feedback.
+- Optional Syzygy probing in endgames when configured.
+
+## 2. Prerequisites
+
+Install project dependencies:
+
+```bash
+cd /Users/vincent/Documents/SDPO/tinker-cookbook
+uv sync --extra verifiers --extra chess --extra wandb
+```
+
+Install Stockfish 18 and ensure it is on `PATH`, or provide absolute path via `stockfish_path`.
+
+For Syzygy endgame probing, download tablebases and set `stockfish_syzygy_path`.
+
+## 3. W&B setup
+
+Authenticate once:
+
+```bash
+wandb login
+```
+
+Recommended environment variables:
+
+```bash
+export WANDB_PROJECT=sdpo-chess
+export WANDB_ENTITY=<your_wandb_team_or_user>
+export WANDB_MODE=online
+```
+
+Pass these through training args:
+
+```bash
+wandb_project=$WANDB_PROJECT wandb_name=sdpo-chess-run-01
+```
+
+Notes:
+
+- Metrics are also written to local `metrics.jsonl` under `log_path`.
+- Resume is automatic from the latest checkpoint in `log_path`.
+
+## 4. SDPO repo hyperparameter parity
+
+This section maps the main SDPO knobs from `lasgroup/SDPO` to Tinker flags.
+
+Primary SDPO sources used:
+
+- `verl/trainer/config/sdpo.yaml`
+- `experiments/rich_feedback/run_sdpo.sh`
+- `experiments/generalization/run_sdpo_all.sh`
+
+### Mapping table
+
+| SDPO repo key | Tinker flag | Typical value(s) |
+|---|---|---|
+| `data.train_batch_size` | `groups_per_batch` | `32` |
+| `actor_rollout_ref.rollout.n` | `group_size` | `8` |
+| `actor_rollout_ref.actor.optim.lr` | `learning_rate` | `1e-6` or `1e-5` |
+| `algorithm.rollout_correction.rollout_is=token` | `advantage_mode` | `token` |
+| `actor...self_distillation.success_reward_threshold` | `success_reward_threshold` | `0.5` |
+| `actor...self_distillation.dont_reprompt_on_self_success` | `dont_reprompt_on_self_success` | `true` |
+| `actor...self_distillation.include_environment_feedback` | `include_environment_feedback` | `true` or `false` |
+| `actor...self_distillation.environment_feedback_only_without_solution` | `environment_feedback_only_without_solution` | `true` |
+| `actor...self_distillation.remove_thinking_from_demonstration` | `remove_thinking_from_demonstration` | `true` |
+| `actor...self_distillation.max_reprompt_len` | `max_reprompt_tokens` | `10240` |
+| `actor...self_distillation.reprompt_truncation` | `reprompt_truncation` | `right` |
+| `actor...self_distillation.full_logit_distillation` | `full_logit_distillation` | `true` |
+| `actor...self_distillation.distillation_topk` | `distillation_topk` | `20` or `100` |
+| `actor...self_distillation.alpha` | `teacher_mix_alpha` | `1.0` or `0.5` |
+| `actor...self_distillation.teacher_regularization` | `teacher_regularization` | `ema` |
+| `actor...self_distillation.teacher_update_rate` / `ema_update_rate` | `teacher_mix_alpha` (for EMA mixture in this implementation) | `0.01` or `0.05` |
+
+Important:
+
+- In Tinker SDPO, `teacher_mix_alpha` is used for teacher-mixture weighting.
+- In the SDPO repo, `alpha` is KL interpolation and `teacher_update_rate` / `ema_update_rate` controls EMA update.
+- They are related but not identical; use the presets below as practical parity settings.
+
+## 5. Ready-to-run parity commands
+
+### A) Rich-feedback-style SDPO parity (from `run_sdpo.sh`)
+
+```bash
+cd /Users/vincent/Documents/SDPO/tinker-cookbook
+
+python -m tinker_cookbook.recipes.verifiers_rl.sdpo_train \
+  vf_env_id=your_chess_env \
+  vf_env_args='{}' \
+  model_name=Qwen/Qwen3-8B \
+  groups_per_batch=32 \
+  group_size=8 \
+  learning_rate=1e-6 \
+  advantage_mode=token \
+  teacher_regularization=ema \
+  teacher_mix_alpha=0.01 \
+  full_logit_distillation=true \
+  distillation_topk=20 \
+  distillation_add_tail=true \
+  success_reward_threshold=0.5 \
+  dont_reprompt_on_self_success=true \
+  include_environment_feedback=true \
+  environment_feedback_only_without_solution=true \
+  remove_thinking_from_demonstration=true \
+  max_reprompt_tokens=10240 \
+  reprompt_truncation=right \
+  updates_per_batch=1 \
+  wandb_project=$WANDB_PROJECT \
+  wandb_name=sdpo-rich-feedback-parity \
+  log_path=/tmp/tinker-examples/sdpo-chess-rich-parity
+```
+
+### B) Generalization-style SDPO parity (from `run_sdpo_all.sh`)
+
+```bash
+cd /Users/vincent/Documents/SDPO/tinker-cookbook
+
+python -m tinker_cookbook.recipes.verifiers_rl.sdpo_train \
+  vf_env_id=your_chess_env \
+  vf_env_args='{}' \
+  model_name=Qwen/Qwen3-8B \
+  groups_per_batch=32 \
+  group_size=8 \
+  learning_rate=1e-5 \
+  advantage_mode=token \
+  teacher_regularization=ema \
+  teacher_mix_alpha=0.05 \
+  full_logit_distillation=true \
+  distillation_topk=100 \
+  distillation_add_tail=true \
+  success_reward_threshold=0.5 \
+  dont_reprompt_on_self_success=true \
+  include_environment_feedback=false \
+  environment_feedback_only_without_solution=true \
+  remove_thinking_from_demonstration=true \
+  max_reprompt_tokens=10240 \
+  reprompt_truncation=right \
+  updates_per_batch=1 \
+  wandb_project=$WANDB_PROJECT \
+  wandb_name=sdpo-generalization-parity \
+  log_path=/tmp/tinker-examples/sdpo-chess-generalization-parity
+```
+
+## 6. Chess-specific hinting + verification
+
+Enable Stockfish hints and feedback:
+
+```bash
+enable_stockfish_hints=true \
+stockfish_path=/path/to/stockfish \
+stockfish_depth=14 \
+stockfish_multipv=5 \
+stockfish_verification_depth=20 \
+include_stockfish_move_feedback=true \
+stockfish_feedback_cp_loss_threshold=20 \
+stockfish_include_fen_decode=true \
+stockfish_include_ascii_board=true \
+stockfish_include_search_stats=true \
+stockfish_syzygy_path=/path/to/syzygy \
+stockfish_syzygy_max_pieces=7
+```
+
+Relevant metrics:
+
+- `sdpo/stockfish_hint_available_fraction`
+- `sdpo/stockfish_hint_used_fraction`
+- `sdpo/stockfish_verified_fraction`
+- `sdpo/stockfish_legal_move_fraction`
+- `sdpo/stockfish_feedback_fraction`
+- `sdpo/stockfish_avg_cp_loss`
+- `sdpo/stockfish_estimated_cp_loss_fraction`
+
+## 7. Suggested W&B dashboard panels
+
+Create panels for:
+
+- Learning signal: `sdpo/mean_advantage`, `sdpo/mean_abs_advantage`.
+- Distillation coverage: `sdpo/reprompt_sample_fraction`, `sdpo/feedback_used_fraction`.
+- Outcome quality: environment reward metric + `sdpo/success_sample_fraction`.
+- Chess move quality: `sdpo/stockfish_avg_cp_loss`, `sdpo/stockfish_legal_move_fraction`.
+- Data quality: `sdpo/num_skipped_samples`, `sdpo/num_zero_adv_samples`.
+
+## 8. Reproducibility checklist
+
+- Pin model ID and exact environment version.
+- Keep `log_path` stable per run family for resume behavior.
+- Log all CLI args in W&B config.
+- Keep Stockfish binary version fixed (18).
+- Keep Syzygy path/version fixed if enabled.
+
+## 9. Common pitfalls
+
+- `strict_single_turn=true` will fail on multi-turn traces. Flatten to one completion segment or set `strict_single_turn=false`.
+- If `stockfish_estimated_cp_loss_fraction` is high, many cp-loss values came from WDL/fallback rather than raw cp deltas.
+- Very long hint templates can dominate context and slow training; trim with `stockfish_hint_max_good_moves`, `stockfish_hint_max_bad_moves`, and `max_*_items`.

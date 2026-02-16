@@ -23,6 +23,10 @@ python -m tinker_cookbook.recipes.verifiers_rl.train vf_env_id=env-id vf_env_arg
 
 The reverse-text example as configured should climb from ~0.2 to ~0.35 in 32 steps.
 
+For a detailed chess-focused SDPO guide with W&B setup and SDPO-repo hyperparameter parity mappings, see:
+
+- [`README_SDPO_TINKER_CHESS.md`](./README_SDPO_TINKER_CHESS.md)
+
 ## SDPO Training Recipe
 
 This folder also includes an SDPO recipe for token-level, on-policy SDPO with verifiers environments:
