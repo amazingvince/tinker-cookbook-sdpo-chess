@@ -120,6 +120,10 @@ def build_teacher_messages(
     feedback_template: str,
     include_environment_feedback: bool,
     environment_feedback_only_without_solution: bool,
+    hints_text: str | None = None,
+    hints_template: str = "\nPosition hints:\n\n{stockfish_hints}\n\n",
+    include_hints: bool = False,
+    hints_only_without_solution: bool = False,
 ) -> tuple[list[renderers.Message], bool, bool]:
     """
     Build teacher messages from the original prompt and optional solution/feedback.
@@ -136,10 +140,16 @@ def build_teacher_messages(
 
     has_solution = bool(solution_text)
     has_feedback = bool(feedback_text)
+    has_hints = bool(hints_text)
     use_feedback = (
         include_environment_feedback
         and has_feedback
         and (not environment_feedback_only_without_solution or not has_solution)
+    )
+    use_hints = (
+        include_hints
+        and has_hints
+        and (not hints_only_without_solution or not has_solution)
     )
 
     solution_section = ""
@@ -150,11 +160,16 @@ def build_teacher_messages(
     if use_feedback:
         feedback_section = feedback_template.format(feedback_raw=feedback_text)
 
-    if has_solution or use_feedback:
+    hints_section = ""
+    if use_hints:
+        hints_section = hints_template.format(stockfish_hints=hints_text)
+
+    if has_solution or use_feedback or use_hints:
         reprompt_text = reprompt_template.format(
             prompt=prompt_text,
             solution=solution_section,
             feedback=feedback_section,
+            hints=hints_section,
         )
         system_messages = original_messages[:-1]
         teacher_messages = system_messages + [{"role": "user", "content": reprompt_text}]

@@ -62,6 +62,21 @@ class CLIConfig:
         "\nThe following is feedback from your unsuccessful earlier attempt:\n\n{feedback_raw}\n\n"
     )
     feedback_keys_csv: str = "feedback,error,errors,judge_feedback"
+    enable_stockfish_hints: bool = False
+    stockfish_path: str = "stockfish"
+    stockfish_depth: int = 14
+    stockfish_multipv: int = 5
+    stockfish_threads: int = 1
+    stockfish_hash_mb: int = 128
+    stockfish_wdl_model: str = "sf"
+    stockfish_max_pv_plies: int = 6
+    stockfish_hint_max_good_moves: int = 3
+    stockfish_hint_max_bad_moves: int = 3
+    stockfish_hint_bad_move_threshold: float = 0.05
+    stockfish_hints_template: str = (
+        "\nStockfish position hints (WDL expected score):\n\n{stockfish_hints}\n\n"
+    )
+    stockfish_hints_only_without_solution: bool = False
     max_reprompt_tokens: int = 10240
     reprompt_truncation: Literal["left", "right", "error"] = "right"
     strict_single_turn: bool = True
@@ -137,6 +152,19 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
         solution_template=cli_config.solution_template,
         feedback_template=cli_config.feedback_template,
         feedback_keys_csv=cli_config.feedback_keys_csv,
+        enable_stockfish_hints=cli_config.enable_stockfish_hints,
+        stockfish_path=cli_config.stockfish_path,
+        stockfish_depth=cli_config.stockfish_depth,
+        stockfish_multipv=cli_config.stockfish_multipv,
+        stockfish_threads=cli_config.stockfish_threads,
+        stockfish_hash_mb=cli_config.stockfish_hash_mb,
+        stockfish_wdl_model=cli_config.stockfish_wdl_model,
+        stockfish_max_pv_plies=cli_config.stockfish_max_pv_plies,
+        stockfish_hint_max_good_moves=cli_config.stockfish_hint_max_good_moves,
+        stockfish_hint_max_bad_moves=cli_config.stockfish_hint_max_bad_moves,
+        stockfish_hint_bad_move_threshold=cli_config.stockfish_hint_bad_move_threshold,
+        stockfish_hints_template=cli_config.stockfish_hints_template,
+        stockfish_hints_only_without_solution=cli_config.stockfish_hints_only_without_solution,
         max_reprompt_tokens=cli_config.max_reprompt_tokens,
         reprompt_truncation=cli_config.reprompt_truncation,
         strict_single_turn=cli_config.strict_single_turn,

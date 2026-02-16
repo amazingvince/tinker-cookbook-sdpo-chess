@@ -39,6 +39,7 @@ python -m tinker_cookbook.recipes.verifiers_rl.sdpo_train \
 The SDPO recipe:
 - defaults to one optimizer update per freshly sampled batch (on-policy), with optional off-policy batch reuse via `updates_per_batch > 1`;
 - builds teacher reprompts from successful peer solutions and/or environment feedback;
+- can optionally add Stockfish 18 chess hints (WDL expected-score and threat summaries) to teacher reprompts when FEN is present in state/prompt;
 - supports teacher regularization via `trust_region` (fixed reference sampler) or `ema` (EMA distribution over recent on-policy samplers);
 - supports optional full-logit distillation with top-k + tail approximation (`full_logit_distillation`, `distillation_topk`, `distillation_add_tail`);
 - supports optional off-policy updates by reusing a sampled batch with Tinker RL losses (`updates_per_batch`, `loss_fn`, `loss_fn_config_json`);
@@ -60,6 +61,42 @@ Expected SDPO metrics in `metrics.jsonl`:
 - `sdpo/full_logit_distillation`
 - `sdpo/topk_overlap_fraction`
 - `sdpo/updates_per_batch`
+- `sdpo/stockfish_hints_enabled`
+- `sdpo/stockfish_hint_available_fraction`
+- `sdpo/stockfish_hint_used_fraction`
+
+### Chess + Stockfish Hints
+
+For chess tasks where the prompt contains a FEN, enable Stockfish-driven hints (using WDL expected score, not centipawns):
+
+```bash
+python -m tinker_cookbook.recipes.verifiers_rl.sdpo_train \
+  vf_env_id=your-chess-env \
+  vf_env_args='{}' \
+  model_name=Qwen/Qwen3-4B-Instruct-2507 \
+  enable_stockfish_hints=true \
+  stockfish_path=/path/to/stockfish \
+  stockfish_depth=14 \
+  stockfish_multipv=5 \
+  stockfish_wdl_model=sf
+```
+
+If enabled, teacher reprompts can include:
+- root WDL expected score (`E = p(win) + 0.5 * p(draw)`);
+- top candidate moves with `delta_E` vs the best line;
+- threat summaries (hanging pieces, threatened pieces, checking opportunities);
+- "moves likely to be bad" explanations with refutation context when available.
+
+To create a starter JSONL dataset of random FENs from Lichess puzzles + games:
+
+```bash
+python -m tinker_cookbook.recipes.verifiers_rl.chess_dataset \
+  output_path=/tmp/chess_positions.jsonl \
+  num_positions=2000 \
+  puzzles_fraction=0.6 \
+  include_stockfish_hints=true \
+  stockfish_path=/path/to/stockfish
+```
 
 You can also evaluate offline:
 

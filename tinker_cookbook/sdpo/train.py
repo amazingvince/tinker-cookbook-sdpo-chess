@@ -18,6 +18,11 @@ from tinker.types import LossFnType
 from tinker_cookbook import checkpoint_utils, model_info, renderers
 from tinker_cookbook.rl import train as rl_train
 from tinker_cookbook.rl.types import RLDatasetBuilder
+from tinker_cookbook.sdpo.chess_hints import (
+    StockfishHintConfig,
+    StockfishHintExtractor,
+    extract_fen_from_state,
+)
 from tinker_cookbook.sdpo.utils import (
     build_sdpo_datum,
     build_teacher_messages,
@@ -42,6 +47,7 @@ class MultiTurnStateError(ValueError):
 @dataclass
 class RolloutSample:
     prompt_messages: list[renderers.Message]
+    fen: str | None
     prompt_tokens: list[int]
     completion_tokens: list[int]
     completion_logprobs: list[float]
@@ -57,6 +63,8 @@ class GroupSdpoStats:
     success_groups: int = 0
     feedback_available_samples: int = 0
     feedback_used_samples: int = 0
+    stockfish_hint_available_samples: int = 0
+    stockfish_hint_used_samples: int = 0
     reprompt_samples: int = 0
     zero_adv_samples: int = 0
     skipped_samples: int = 0
@@ -111,6 +119,21 @@ class Config:
         "\nThe following is feedback from your unsuccessful earlier attempt:\n\n{feedback_raw}\n\n"
     )
     feedback_keys_csv: str = "feedback,error,errors,judge_feedback"
+    enable_stockfish_hints: bool = False
+    stockfish_path: str = "stockfish"
+    stockfish_depth: int = 14
+    stockfish_multipv: int = 5
+    stockfish_threads: int = 1
+    stockfish_hash_mb: int = 128
+    stockfish_wdl_model: str = "sf"
+    stockfish_max_pv_plies: int = 6
+    stockfish_hint_max_good_moves: int = 3
+    stockfish_hint_max_bad_moves: int = 3
+    stockfish_hint_bad_move_threshold: float = 0.05
+    stockfish_hints_template: str = (
+        "\nStockfish position hints (WDL expected score):\n\n{stockfish_hints}\n\n"
+    )
+    stockfish_hints_only_without_solution: bool = False
     max_reprompt_tokens: int = 10240
     reprompt_truncation: Literal["left", "right", "error"] = "right"
     strict_single_turn: bool = True
@@ -192,6 +215,7 @@ def _extract_rollout_sample(
     strict_single_turn: bool,
 ) -> RolloutSample:
     prompt_messages = _normalize_prompt_messages(state.get("prompt"))
+    fen = extract_fen_from_state(state, prompt_messages)
     prompt_tokens, completion_tokens, completion_logprobs = _extract_single_turn_tokens(
         state=state,
         strict_single_turn=strict_single_turn,
@@ -202,6 +226,7 @@ def _extract_rollout_sample(
 
     return RolloutSample(
         prompt_messages=prompt_messages,
+        fen=fen,
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
         completion_logprobs=completion_logprobs,
@@ -689,6 +714,7 @@ async def build_group_sdpo_datums(
     tokenizer: Tokenizer,
     feedback_keys: Sequence[str],
     teacher_logprob_semaphore: asyncio.Semaphore | None,
+    stockfish_hint_extractor: StockfishHintExtractor | None,
 ) -> tuple[list[tinker.Datum], GroupSdpoStats]:
     records: list[RolloutSample] = []
     stats = GroupSdpoStats()
@@ -720,8 +746,9 @@ async def build_group_sdpo_datums(
     )
     stats.success_groups = 1 if stats.success_samples > 0 else 0
 
+    stockfish_hints_by_fen: dict[str, str] = {}
     datum_tasks: list[
-        asyncio.Task[tuple[tinker.Datum, list[float], bool, bool, int, int]]
+        asyncio.Task[tuple[tinker.Datum, list[float], bool, bool, bool, int, int]]
     ] = []
 
     for i, sample in enumerate(records):
@@ -738,6 +765,30 @@ async def build_group_sdpo_datums(
             if config.remove_thinking_from_demonstration:
                 solution_text = maybe_strip_thinking(solution_text)
 
+        stockfish_hints_text: str | None = None
+        if (
+            config.enable_stockfish_hints
+            and stockfish_hint_extractor is not None
+            and sample.fen is not None
+        ):
+            if sample.fen not in stockfish_hints_by_fen:
+                try:
+                    stockfish_hints_by_fen[sample.fen] = stockfish_hint_extractor.analyze_and_render(
+                        sample.fen
+                    )
+                except Exception as exc:
+                    logger.warning("Failed to build Stockfish hints for FEN %s: %s", sample.fen, exc)
+                    stockfish_hints_by_fen[sample.fen] = ""
+            cached_hints = stockfish_hints_by_fen[sample.fen]
+            if cached_hints:
+                stockfish_hints_text = cached_hints
+
+        stockfish_hint_used = (
+            config.enable_stockfish_hints
+            and stockfish_hints_text is not None
+            and (not config.stockfish_hints_only_without_solution or not bool(solution_text))
+        )
+
         teacher_messages, feedback_used, used_reprompt = build_teacher_messages(
             prompt_messages=sample.prompt_messages,
             solution_text=solution_text,
@@ -747,6 +798,10 @@ async def build_group_sdpo_datums(
             feedback_template=config.feedback_template,
             include_environment_feedback=config.include_environment_feedback,
             environment_feedback_only_without_solution=config.environment_feedback_only_without_solution,
+            hints_text=stockfish_hints_text,
+            hints_template=config.stockfish_hints_template,
+            include_hints=config.enable_stockfish_hints,
+            hints_only_without_solution=config.stockfish_hints_only_without_solution,
         )
 
         async def _build_datum(
@@ -755,7 +810,8 @@ async def build_group_sdpo_datums(
             local_teacher_messages: list[renderers.Message] = teacher_messages,
             local_feedback_used: bool = feedback_used,
             local_used_reprompt: bool = used_reprompt,
-        ) -> tuple[tinker.Datum, list[float], bool, bool, int, int]:
+            local_stockfish_hint_used: bool = stockfish_hint_used,
+        ) -> tuple[tinker.Datum, list[float], bool, bool, bool, int, int]:
             advantages, topk_overlap_count, topk_total_count = await _compute_sample_advantages(
                 sample=rollout_sample,
                 teacher_messages=local_teacher_messages,
@@ -792,6 +848,7 @@ async def build_group_sdpo_datums(
                 advantages,
                 local_feedback_used,
                 local_used_reprompt,
+                local_stockfish_hint_used,
                 topk_overlap_count,
                 topk_total_count,
             )
@@ -805,6 +862,7 @@ async def build_group_sdpo_datums(
             advantages,
             feedback_used,
             used_reprompt,
+            stockfish_hint_used,
             topk_overlap_count,
             topk_total_count,
         ) = await task
@@ -812,6 +870,8 @@ async def build_group_sdpo_datums(
 
         if feedback_used:
             stats.feedback_used_samples += 1
+        if stockfish_hint_used:
+            stats.stockfish_hint_used_samples += 1
         if used_reprompt:
             stats.reprompt_samples += 1
         if all(abs(v) < 1e-12 for v in advantages):
@@ -824,6 +884,16 @@ async def build_group_sdpo_datums(
         stats.topk_total_count += topk_total_count
 
     stats.feedback_available_samples = sum(1 for record in records if record.feedback_text is not None)
+    stats.stockfish_hint_available_samples = sum(
+        1
+        for record in records
+        if (
+            config.enable_stockfish_hints
+            and stockfish_hint_extractor is not None
+            and record.fen is not None
+            and bool(stockfish_hints_by_fen.get(record.fen))
+        )
+    )
     return data, stats
 
 
@@ -836,6 +906,7 @@ async def run_sdpo_batch_update(
     renderer: renderers.Renderer,
     tokenizer: Tokenizer,
     states_by_group: Sequence[Sequence[Mapping[str, Any]]],
+    stockfish_hint_extractor: StockfishHintExtractor | None,
 ) -> dict[str, Any]:
     if not 0.0 <= config.grpo_mix_lambda <= 1.0:
         raise ValueError(f"grpo_mix_lambda must be in [0, 1], got {config.grpo_mix_lambda}")
@@ -869,6 +940,7 @@ async def run_sdpo_batch_update(
             tokenizer=tokenizer,
             feedback_keys=feedback_keys,
             teacher_logprob_semaphore=teacher_logprob_semaphore,
+            stockfish_hint_extractor=stockfish_hint_extractor,
         )
         all_data.extend(group_data)
 
@@ -877,6 +949,8 @@ async def run_sdpo_batch_update(
         total_stats.success_groups += group_stats.success_groups
         total_stats.feedback_available_samples += group_stats.feedback_available_samples
         total_stats.feedback_used_samples += group_stats.feedback_used_samples
+        total_stats.stockfish_hint_available_samples += group_stats.stockfish_hint_available_samples
+        total_stats.stockfish_hint_used_samples += group_stats.stockfish_hint_used_samples
         total_stats.reprompt_samples += group_stats.reprompt_samples
         total_stats.zero_adv_samples += group_stats.zero_adv_samples
         total_stats.skipped_samples += group_stats.skipped_samples
@@ -894,6 +968,7 @@ async def run_sdpo_batch_update(
         "sdpo/grpo_mix_lambda": config.grpo_mix_lambda,
         "sdpo/full_logit_distillation": float(config.full_logit_distillation),
         "sdpo/updates_per_batch": float(config.updates_per_batch),
+        "sdpo/stockfish_hints_enabled": float(config.enable_stockfish_hints),
     }
 
     if len(states_by_group) > 0:
@@ -909,11 +984,19 @@ async def run_sdpo_batch_update(
         metrics["sdpo/feedback_used_fraction"] = (
             total_stats.feedback_used_samples / total_stats.num_samples
         )
+        metrics["sdpo/stockfish_hint_available_fraction"] = (
+            total_stats.stockfish_hint_available_samples / total_stats.num_samples
+        )
+        metrics["sdpo/stockfish_hint_used_fraction"] = (
+            total_stats.stockfish_hint_used_samples / total_stats.num_samples
+        )
         metrics["sdpo/reprompt_sample_fraction"] = total_stats.reprompt_samples / total_stats.num_samples
     else:
         metrics["sdpo/success_sample_fraction"] = 0.0
         metrics["sdpo/feedback_available_fraction"] = 0.0
         metrics["sdpo/feedback_used_fraction"] = 0.0
+        metrics["sdpo/stockfish_hint_available_fraction"] = 0.0
+        metrics["sdpo/stockfish_hint_used_fraction"] = 0.0
         metrics["sdpo/reprompt_sample_fraction"] = 0.0
 
     metrics["sdpo/num_zero_adv_samples"] = total_stats.zero_adv_samples
@@ -1090,76 +1173,97 @@ async def main(config: Config):
     ema_teacher_clients: deque[tinker.SamplingClient] = deque(
         maxlen=max(1, config.ema_teacher_history)
     )
-
-    for i_batch in range(start_batch, num_batches):
-        metrics: dict[str, Any] = {
-            "progress/batch": i_batch,
-            "progress/done_frac": (i_batch + 1) / num_batches,
-            "optim/lr": config.learning_rate,
-        }
-        t_start = time.time()
-
-        with timed("save_weights_and_get_sampling_client", metrics):
-            current_sampling_client = await training_client.save_weights_and_get_sampling_client_async()
-        if config.teacher_regularization == "ema":
-            ema_teacher_clients.appendleft(current_sampling_client)
-
-        env_group_builders = dataset.get_batch(i_batch)
-        with timed("rollout", metrics):
-            states_by_group = await rl_train.gather_with_progress(
-                (
-                    _run_verifiers_group_rollout(
-                        builder=builder,
-                        sampling_client=current_sampling_client,
-                        renderer=renderer,
-                        tokenizer=tokenizer,
-                        group_size=config.group_size,
-                        max_tokens=config.max_tokens,
-                        temperature=config.temperature,
-                        max_concurrent_generation=config.max_concurrent_generation,
-                        max_concurrent_scoring=config.max_concurrent_scoring,
-                    )
-                    for builder in env_group_builders
-                ),
-                desc=f"SDPO sampling batch {i_batch}",
-            )
-
-        sdpo_metrics = await run_sdpo_batch_update(
-            config=config,
-            training_client=training_client,
-            current_sampling_client=current_sampling_client,
-            reference_sampling_client=reference_sampling_client,
-            ema_teacher_sampling_clients=list(ema_teacher_clients),
-            renderer=renderer,
-            tokenizer=tokenizer,
-            states_by_group=states_by_group,
-        )
-        metrics.update(sdpo_metrics)
-
-        if config.save_every > 0 and (i_batch + 1) % config.save_every == 0:
-            with timed("save_checkpoint", metrics):
-                checkpoint_paths = await checkpoint_utils.save_checkpoint_async(
-                    training_client=training_client,
-                    name=f"{i_batch + 1:06d}",
-                    log_path=config.log_path,
-                    loop_state={"batch": i_batch + 1},
-                    kind="both",
-                    ttl_seconds=config.ttl_seconds,
+    stockfish_hint_extractor: StockfishHintExtractor | None = None
+    try:
+        if config.enable_stockfish_hints:
+            stockfish_hint_extractor = StockfishHintExtractor(
+                StockfishHintConfig(
+                    stockfish_path=config.stockfish_path,
+                    depth=config.stockfish_depth,
+                    multipv=config.stockfish_multipv,
+                    threads=config.stockfish_threads,
+                    hash_mb=config.stockfish_hash_mb,
+                    wdl_model=config.stockfish_wdl_model,
+                    max_pv_plies=config.stockfish_max_pv_plies,
+                    max_good_moves=config.stockfish_hint_max_good_moves,
+                    max_bad_moves=config.stockfish_hint_max_bad_moves,
+                    bad_move_threshold=config.stockfish_hint_bad_move_threshold,
                 )
-            metrics.update(checkpoint_paths)
+            )
+            logger.info("Stockfish hints enabled via %s", config.stockfish_path)
 
-        metrics["time/total"] = time.time() - t_start
-        ml_logger.log_metrics(metrics, step=i_batch)
+        for i_batch in range(start_batch, num_batches):
+            metrics: dict[str, Any] = {
+                "progress/batch": i_batch,
+                "progress/done_frac": (i_batch + 1) / num_batches,
+                "optim/lr": config.learning_rate,
+            }
+            t_start = time.time()
 
-    if start_batch < num_batches:
-        await checkpoint_utils.save_checkpoint_async(
-            training_client=training_client,
-            name="final",
-            log_path=config.log_path,
-            loop_state={"batch": num_batches},
-            kind="both",
-            ttl_seconds=config.ttl_seconds,
-        )
+            with timed("save_weights_and_get_sampling_client", metrics):
+                current_sampling_client = await training_client.save_weights_and_get_sampling_client_async()
+            if config.teacher_regularization == "ema":
+                ema_teacher_clients.appendleft(current_sampling_client)
 
-    ml_logger.close()
-    logger.info("SDPO training completed successfully")
+            env_group_builders = dataset.get_batch(i_batch)
+            with timed("rollout", metrics):
+                states_by_group = await rl_train.gather_with_progress(
+                    (
+                        _run_verifiers_group_rollout(
+                            builder=builder,
+                            sampling_client=current_sampling_client,
+                            renderer=renderer,
+                            tokenizer=tokenizer,
+                            group_size=config.group_size,
+                            max_tokens=config.max_tokens,
+                            temperature=config.temperature,
+                            max_concurrent_generation=config.max_concurrent_generation,
+                            max_concurrent_scoring=config.max_concurrent_scoring,
+                        )
+                        for builder in env_group_builders
+                    ),
+                    desc=f"SDPO sampling batch {i_batch}",
+                )
+
+            sdpo_metrics = await run_sdpo_batch_update(
+                config=config,
+                training_client=training_client,
+                current_sampling_client=current_sampling_client,
+                reference_sampling_client=reference_sampling_client,
+                ema_teacher_sampling_clients=list(ema_teacher_clients),
+                renderer=renderer,
+                tokenizer=tokenizer,
+                states_by_group=states_by_group,
+                stockfish_hint_extractor=stockfish_hint_extractor,
+            )
+            metrics.update(sdpo_metrics)
+
+            if config.save_every > 0 and (i_batch + 1) % config.save_every == 0:
+                with timed("save_checkpoint", metrics):
+                    checkpoint_paths = await checkpoint_utils.save_checkpoint_async(
+                        training_client=training_client,
+                        name=f"{i_batch + 1:06d}",
+                        log_path=config.log_path,
+                        loop_state={"batch": i_batch + 1},
+                        kind="both",
+                        ttl_seconds=config.ttl_seconds,
+                    )
+                metrics.update(checkpoint_paths)
+
+            metrics["time/total"] = time.time() - t_start
+            ml_logger.log_metrics(metrics, step=i_batch)
+
+        if start_batch < num_batches:
+            await checkpoint_utils.save_checkpoint_async(
+                training_client=training_client,
+                name="final",
+                log_path=config.log_path,
+                loop_state={"batch": num_batches},
+                kind="both",
+                ttl_seconds=config.ttl_seconds,
+            )
+        logger.info("SDPO training completed successfully")
+    finally:
+        if stockfish_hint_extractor is not None:
+            stockfish_hint_extractor.close()
+        ml_logger.close()

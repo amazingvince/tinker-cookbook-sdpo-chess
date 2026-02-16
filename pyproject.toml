@@ -63,12 +63,16 @@ verifiers = [
     "verifiers>=0.1.9,<0.1.10",
     "openai",
 ]
+chess = [
+    "python-chess>=1.11.2",
+]
 all = [
     "tinker_cookbook[vector-search]",
     "tinker_cookbook[wandb]",
     "tinker_cookbook[neptune-scale]",
     "tinker_cookbook[trackio]",
     "tinker_cookbook[verifiers]",
+    "tinker_cookbook[chess]",
 ]
 
 [build-system]

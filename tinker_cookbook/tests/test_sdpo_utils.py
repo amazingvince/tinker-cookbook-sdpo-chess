@@ -249,6 +249,24 @@ def test_build_teacher_messages_variants():
     assert feedback_used is False
     assert no_sections == prompt_messages
 
+    hints_only, feedback_used, used_reprompt = build_teacher_messages(
+        prompt_messages=prompt_messages,
+        solution_text=None,
+        feedback_text=None,
+        reprompt_template="{prompt}{solution}{feedback}{hints}",
+        solution_template=" SOLUTION={successful_previous_attempt}",
+        feedback_template=" FEEDBACK={feedback_raw}",
+        include_environment_feedback=True,
+        environment_feedback_only_without_solution=True,
+        hints_text="Line: Qh5+ and pressure on f7",
+        hints_template=" HINTS={stockfish_hints}",
+        include_hints=True,
+        hints_only_without_solution=False,
+    )
+    assert used_reprompt is True
+    assert feedback_used is False
+    assert "HINTS=Line: Qh5+ and pressure on f7" in str(hints_only[-1]["content"])
+
 
 def test_trust_region_mix_logprob_matches_manual_logsumexp():
     student = torch.tensor([-0.2, -0.7], dtype=torch.float32)
@@ -305,6 +323,7 @@ def test_zero_advantage_when_no_reprompt_source():
             tokenizer=_FakeTokenizer(),
             feedback_keys=["feedback"],
             teacher_logprob_semaphore=None,
+            stockfish_hint_extractor=None,
         )
         assert len(data) == 1
         assert stats.zero_adv_samples == 1
@@ -377,6 +396,7 @@ def test_grpo_mix_lambda_without_reprompt(monkeypatch):
             renderer=_FakeRenderer(),
             tokenizer=_FakeTokenizer(),
             states_by_group=[[state_high_reward, state_low_reward]],
+            stockfish_hint_extractor=None,
         )
         assert metrics["sdpo/num_zero_adv_samples"] == 0
         assert metrics["sdpo/mean_abs_advantage"] > 0.0
@@ -438,6 +458,7 @@ def test_run_sdpo_batch_update_mocked_path(monkeypatch):
             renderer=_FakeRenderer(),
             tokenizer=_FakeTokenizer(),
             states_by_group=[[success_state, failed_state]],
+            stockfish_hint_extractor=None,
         )
 
         assert captured["loss_fn"] == "importance_sampling"
@@ -449,6 +470,9 @@ def test_run_sdpo_batch_update_mocked_path(monkeypatch):
         assert metrics["sdpo/success_sample_fraction"] == 0.5
         assert metrics["sdpo/feedback_available_fraction"] == 0.5
         assert metrics["sdpo/feedback_used_fraction"] == 0.0
+        assert metrics["sdpo/stockfish_hints_enabled"] == 0.0
+        assert metrics["sdpo/stockfish_hint_available_fraction"] == 0.0
+        assert metrics["sdpo/stockfish_hint_used_fraction"] == 0.0
         assert metrics["sdpo/reprompt_sample_fraction"] == 0.5
         assert metrics["sdpo/num_zero_adv_samples"] == 1
         assert metrics["sdpo/num_skipped_samples"] == 0
@@ -463,6 +487,73 @@ def test_ema_distribution_weights_properties():
     assert len(weights) == 4
     assert math.isclose(sum(weights), 1.0, rel_tol=1e-6, abs_tol=1e-6)
     assert weights[0] > weights[1] > weights[2]
+
+
+def test_stockfish_hint_metrics(monkeypatch):
+    class _FakeStockfishHintExtractor:
+        def analyze_and_render(self, fen: str) -> str:
+            return f"hints for {fen}"
+
+    async def fake_train_step(
+        data_D: list[sdpo_train.tinker.Datum],
+        training_client: Any,
+        learning_rate: float,
+        num_substeps: int,
+        loss_fn: str,
+        loss_fn_config: dict[str, Any] | None = None,
+        metrics: dict[str, Any] | None = None,
+    ):
+        _ = (
+            data_D,
+            training_client,
+            learning_rate,
+            num_substeps,
+            loss_fn,
+            loss_fn_config,
+            metrics,
+        )
+        return []
+
+    monkeypatch.setattr(sdpo_train.rl_train, "train_step", fake_train_step)
+
+    async def _inner():
+        config = _make_config(
+            teacher_regularization="none",
+            enable_stockfish_hints=True,
+            reprompt_template="{prompt}{solution}{feedback}{hints}",
+        )
+        state = _make_state(
+            prompt_messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        "FEN: r6k/pp2r2p/4Rp1Q/3p4/8/1N1P2R1/PqP2bPP/7K b - - 0 24"
+                    ),
+                }
+            ],
+            prompt_ids=[10, 11],
+            completion_ids=[12, 13],
+            completion_logprobs=[-1.2, -1.1],
+            reward=0.0,
+            feedback_text=None,
+        )
+
+        metrics = await sdpo_train.run_sdpo_batch_update(
+            config=config,
+            training_client=object(),
+            current_sampling_client=_FakeSamplingClient(base_logprob=-0.2),
+            reference_sampling_client=None,
+            ema_teacher_sampling_clients=None,
+            renderer=_FakeRenderer(),
+            tokenizer=_FakeTokenizer(),
+            states_by_group=[[state]],
+            stockfish_hint_extractor=_FakeStockfishHintExtractor(),
+        )
+        assert metrics["sdpo/stockfish_hints_enabled"] == 1.0
+        assert metrics["sdpo/stockfish_hint_available_fraction"] == 1.0
+        assert metrics["sdpo/stockfish_hint_used_fraction"] == 1.0
+
+    asyncio.run(_inner())
 
 
 def test_topk_tail_advantage_matches_manual_computation():
@@ -531,6 +622,7 @@ def test_full_logit_distillation_topk_path(monkeypatch):
             renderer=_FakeRenderer(),
             tokenizer=_FakeTokenizer(),
             states_by_group=[[success_state, failed_state]],
+            stockfish_hint_extractor=None,
         )
         assert metrics["sdpo/full_logit_distillation"] == 1.0
         assert metrics["sdpo/topk_overlap_fraction"] > 0.0
@@ -589,6 +681,7 @@ def test_updates_per_batch_and_loss_fn(monkeypatch):
             renderer=_FakeRenderer(),
             tokenizer=_FakeTokenizer(),
             states_by_group=[[success_state, failed_state]],
+            stockfish_hint_extractor=None,
         )
         assert metrics["sdpo/updates_per_batch"] == 3.0
 
@@ -647,6 +740,7 @@ def test_ema_teacher_regularization_path(monkeypatch):
             renderer=_FakeRenderer(),
             tokenizer=_FakeTokenizer(),
             states_by_group=[[success_state, failed_state]],
+            stockfish_hint_extractor=None,
         )
         assert metrics["sdpo/mean_abs_advantage"] > 0.0
 
@@ -704,6 +798,7 @@ def test_full_logit_distillation_with_ema_teacher(monkeypatch):
             renderer=_FakeRenderer(),
             tokenizer=_FakeTokenizer(),
             states_by_group=[[success_state, failed_state]],
+            stockfish_hint_extractor=None,
         )
         assert metrics["sdpo/full_logit_distillation"] == 1.0
         assert metrics["sdpo/topk_overlap_fraction"] > 0.0
