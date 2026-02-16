@@ -45,6 +45,31 @@ Install Stockfish 18 and ensure it is on `PATH`, or provide absolute path via `s
 
 For Syzygy endgame probing, download tablebases and set `stockfish_syzygy_path`.
 
+### Bootstrap helpers (new)
+
+Auto-tune Stockfish flags from detected CPU/RAM:
+
+```bash
+python -m tinker_cookbook.recipes.verifiers_rl.stockfish_autotune output_format=json
+```
+
+Install the best Stockfish release asset for detected CPU instructions:
+
+```bash
+python -m tinker_cookbook.recipes.verifiers_rl.install_stockfish
+```
+
+Install Syzygy endgame tables (default `3-4-5`, about 0.9 GB):
+
+```bash
+python -m tinker_cookbook.recipes.verifiers_rl.install_syzygy
+```
+
+Optional larger installs:
+
+- `pieces=6` (about 149 GB)
+- `pieces=all` (includes 7-man, about 17 TB; usually impractical)
+
 ## 3. W&B setup
 
 Authenticate once:

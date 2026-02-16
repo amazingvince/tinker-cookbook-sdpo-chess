@@ -120,6 +120,12 @@ If enabled, teacher reprompts can include:
   - cp-loss with source (`centipawn`, `wdl_scaled`, or fallback penalty if score is unavailable);
   - best and predicted PV lines for concrete guidance.
 
+Helper utilities for chess runtime setup:
+
+- `python -m tinker_cookbook.recipes.verifiers_rl.stockfish_autotune`
+- `python -m tinker_cookbook.recipes.verifiers_rl.install_stockfish`
+- `python -m tinker_cookbook.recipes.verifiers_rl.install_syzygy`
+
 To create a starter JSONL dataset of random FENs from Lichess puzzles + games:
 
 ```bash
