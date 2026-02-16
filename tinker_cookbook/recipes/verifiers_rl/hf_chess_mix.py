@@ -8,6 +8,7 @@ import math
 import random
 import re
 import threading
+import time
 from collections.abc import Mapping
 from typing import Any
 
@@ -417,9 +418,28 @@ def _iter_dataset_rows(
     seed: int,
     shuffle_buffer_size: int,
 ) -> IterableDataset:
+    t0 = time.monotonic()
+    logger.info(
+        "hf-chess-mix: load_dataset(streaming=True) start dataset=%s seed=%d shuffle_buffer_size=%d",
+        dataset_name,
+        seed,
+        shuffle_buffer_size,
+    )
     stream = load_dataset(dataset_name, split="train", streaming=True)
+    logger.info(
+        "hf-chess-mix: load_dataset(streaming=True) ready dataset=%s elapsed=%.2fs",
+        dataset_name,
+        time.monotonic() - t0,
+    )
     if shuffle_buffer_size > 1:
+        t_shuffle = time.monotonic()
         stream = stream.shuffle(seed=seed, buffer_size=shuffle_buffer_size)
+        logger.info(
+            "hf-chess-mix: stream shuffle configured dataset=%s buffer_size=%d elapsed=%.2fs",
+            dataset_name,
+            shuffle_buffer_size,
+            time.monotonic() - t_shuffle,
+        )
     return stream
 
 
@@ -445,6 +465,10 @@ def _collect_examples(
     rng = random.Random(seed)
     rows: list[dict[str, Any]] = []
     scanned = 0
+    started_at = time.monotonic()
+    last_heartbeat = started_at
+    total_parse_seconds = 0.0
+    heartbeat_seconds = 20.0
     log_every = max(1000, min(50000, max_scan_rows // 20 if max_scan_rows > 0 else 10000))
     stream = _iter_dataset_rows(
         dataset_name=dataset_name,
@@ -472,8 +496,25 @@ def _collect_examples(
             break
         if not isinstance(row, Mapping):
             continue
+        parse_started_at = time.monotonic()
         parsed = parser(row, rng)
+        parse_seconds = time.monotonic() - parse_started_at
+        total_parse_seconds += parse_seconds
         if not parsed:
+            now = time.monotonic()
+            if now - last_heartbeat >= heartbeat_seconds:
+                elapsed = max(1e-6, now - started_at)
+                logger.info(
+                    "hf-chess-mix: heartbeat dataset=%s elapsed=%.1fs scanned=%d collected=%d/%d rows_per_sec=%.2f avg_parse_ms=%.1f",
+                    dataset_name,
+                    elapsed,
+                    scanned,
+                    len(rows),
+                    target_count,
+                    scanned / elapsed,
+                    (total_parse_seconds / max(scanned, 1)) * 1000.0,
+                )
+                last_heartbeat = now
             continue
         remaining = target_count - len(rows)
         if remaining <= 0:
@@ -484,6 +525,20 @@ def _collect_examples(
             rows.extend(parsed_copy[:remaining])
             break
         rows.extend(parsed)
+        now = time.monotonic()
+        if now - last_heartbeat >= heartbeat_seconds:
+            elapsed = max(1e-6, now - started_at)
+            logger.info(
+                "hf-chess-mix: heartbeat dataset=%s elapsed=%.1fs scanned=%d collected=%d/%d rows_per_sec=%.2f avg_parse_ms=%.1f",
+                dataset_name,
+                elapsed,
+                scanned,
+                len(rows),
+                target_count,
+                scanned / elapsed,
+                (total_parse_seconds / max(scanned, 1)) * 1000.0,
+            )
+            last_heartbeat = now
         if len(rows) >= target_count:
             break
     logger.info(
