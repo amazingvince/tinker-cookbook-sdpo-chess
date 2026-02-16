@@ -9,8 +9,9 @@ import random
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, Callable
 
 from datasets import Dataset, IterableDataset, load_dataset
 
@@ -83,6 +84,50 @@ class _StockfishBestMoveOracle:
 
     def close(self) -> None:
         self._extractor.close()
+
+
+class _StockfishBestMoveOraclePool:
+    def __init__(self, config: StockfishHintConfig, num_workers: int):
+        if num_workers <= 0:
+            raise ValueError(f"num_workers must be >= 1, got {num_workers}")
+        self._config = config
+        self._num_workers = int(num_workers)
+        self._workers: list[_StockfishBestMoveOracle] = []
+        self._locks: list[threading.Lock] = []
+        self._init_lock = threading.Lock()
+        self._rr_counter = itertools.count()
+        self._closed = False
+
+    def _ensure_workers(self) -> None:
+        if self._workers:
+            return
+        with self._init_lock:
+            if self._workers:
+                return
+            self._workers = [_StockfishBestMoveOracle(self._config) for _ in range(self._num_workers)]
+            self._locks = [threading.Lock() for _ in range(self._num_workers)]
+
+    def get_best_move(self, fen: str) -> tuple[str, float | None] | None:
+        if self._closed:
+            raise RuntimeError("Stockfish best-move oracle pool is closed")
+        self._ensure_workers()
+        idx = next(self._rr_counter) % len(self._workers)
+        worker = self._workers[idx]
+        lock = self._locks[idx]
+        with lock:
+            return worker.get_best_move(fen)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for worker in self._workers:
+            try:
+                worker.close()
+            except Exception:
+                pass
+        self._workers = []
+        self._locks = []
 
 
 class _AsyncStockfishVerifierPool:
@@ -580,6 +625,97 @@ def _assemble_mixed_examples(
     return selected
 
 
+def _label_selected_game_rows_with_best_moves(
+    rows: list[dict[str, Any]],
+    *,
+    get_best_move: Callable[[str], tuple[str, float | None] | None],
+    num_workers: int,
+) -> tuple[int, int]:
+    fen_to_indices: dict[str, list[int]] = {}
+    for idx, row in enumerate(rows):
+        info = row.get("info")
+        if not isinstance(info, Mapping):
+            continue
+        source = str(info.get("source", "")).strip().lower()
+        if source != "lichess_game":
+            continue
+        fen = _as_stripped(info.get("fen"))
+        if fen is None:
+            continue
+        fen_to_indices.setdefault(fen, []).append(idx)
+
+    unique_fens = list(fen_to_indices.keys())
+    if not unique_fens:
+        return 0, 0
+
+    worker_count = max(1, min(int(num_workers), len(unique_fens)))
+    logger.info(
+        "hf-chess-mix: stockfish labeling start selected_game_rows=%d unique_fens=%d workers=%d",
+        sum(len(indices) for indices in fen_to_indices.values()),
+        len(unique_fens),
+        worker_count,
+    )
+
+    started_at = time.monotonic()
+    total = len(unique_fens)
+    completed = 0
+    log_every = max(100, min(2000, total // 20 if total > 0 else 100))
+    best_by_fen: dict[str, tuple[str, float | None] | None] = {}
+
+    with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="stockfish_label") as executor:
+        futures = {executor.submit(get_best_move, fen): fen for fen in unique_fens}
+        for future in as_completed(futures):
+            fen = futures[future]
+            completed += 1
+            try:
+                best_by_fen[fen] = future.result()
+            except Exception as exc:
+                logger.warning("hf-chess-mix: stockfish labeling failed for fen=%s: %s", fen, exc)
+                best_by_fen[fen] = None
+
+            if completed % log_every == 0 or completed == total:
+                elapsed = max(1e-6, time.monotonic() - started_at)
+                logger.info(
+                    "hf-chess-mix: stockfish labeling progress completed=%d/%d elapsed=%.1fs fens_per_sec=%.2f",
+                    completed,
+                    total,
+                    elapsed,
+                    completed / elapsed,
+                )
+
+    labeled_samples = 0
+    skipped_samples = 0
+    for fen, indices in fen_to_indices.items():
+        best = best_by_fen.get(fen)
+        if best is None:
+            skipped_samples += len(indices)
+            continue
+        best_move, best_expected_score = best
+        for idx in indices:
+            row = rows[idx]
+            row["answer"] = best_move
+            info_obj = row.get("info")
+            if isinstance(info_obj, dict):
+                info_dict = info_obj
+            elif isinstance(info_obj, Mapping):
+                info_dict = dict(info_obj)
+                row["info"] = info_dict
+            else:
+                info_dict = {}
+                row["info"] = info_dict
+            info_dict["game_answer_mode"] = "stockfish"
+            info_dict["stockfish_best_move"] = best_move
+            info_dict["stockfish_best_expected_score"] = best_expected_score
+            labeled_samples += 1
+
+    logger.info(
+        "hf-chess-mix: stockfish labeling complete labeled_samples=%d skipped_samples=%d",
+        labeled_samples,
+        skipped_samples,
+    )
+    return labeled_samples, skipped_samples
+
+
 def _build_dataset(
     *,
     max_examples: int,
@@ -599,6 +735,7 @@ def _build_dataset(
     game_positions_per_game: int,
     game_answer_mode: str,
     stockfish_config: StockfishHintConfig,
+    stockfish_num_workers: int,
     shuffle: bool,
 ) -> Dataset:
     pool_size = max(max_examples, max_examples * oversample_factor)
@@ -631,37 +768,29 @@ def _build_dataset(
         len(puzzle_rows),
         puzzles_dataset,
     )
-    best_move_oracle: _StockfishBestMoveOracle | None = None
-    try:
-        if game_answer_mode == "stockfish" and game_pool_target > 0:
-            logger.info("hf-chess-mix: initializing Stockfish best-move oracle for game labeling")
-            best_move_oracle = _StockfishBestMoveOracle(stockfish_config)
-
-        game_rows = _collect_examples(
-            dataset_name=games_dataset,
-            target_count=game_pool_target,
-            max_scan_rows=max_scan_rows_per_source,
-            seed=seed + 29,
-            shuffle_buffer_size=shuffle_buffer_size,
-            parser=lambda row, rng: _parse_game_row(
-                row=row,
-                rng=rng,
-                min_game_ply=min_game_ply,
-                max_game_ply=max_game_ply,
-                min_game_average_elo=min_game_average_elo,
-                game_positions_per_game=game_positions_per_game,
-                game_answer_mode=game_answer_mode,
-                best_move_oracle=best_move_oracle,
-            ),
-        )
-        logger.info(
-            "hf-chess-mix: collected game candidate rows=%d from %s",
-            len(game_rows),
-            games_dataset,
-        )
-    finally:
-        if best_move_oracle is not None:
-            best_move_oracle.close()
+    game_parse_answer_mode = "pgn" if game_answer_mode == "stockfish" else game_answer_mode
+    game_rows = _collect_examples(
+        dataset_name=games_dataset,
+        target_count=game_pool_target,
+        max_scan_rows=max_scan_rows_per_source,
+        seed=seed + 29,
+        shuffle_buffer_size=shuffle_buffer_size,
+        parser=lambda row, rng: _parse_game_row(
+            row=row,
+            rng=rng,
+            min_game_ply=min_game_ply,
+            max_game_ply=max_game_ply,
+            min_game_average_elo=min_game_average_elo,
+            game_positions_per_game=game_positions_per_game,
+            game_answer_mode=game_parse_answer_mode,
+            best_move_oracle=None,
+        ),
+    )
+    logger.info(
+        "hf-chess-mix: collected game candidate rows=%d from %s",
+        len(game_rows),
+        games_dataset,
+    )
 
     mixed_rows = _assemble_mixed_examples(
         puzzle_rows=puzzle_rows,
@@ -670,6 +799,19 @@ def _build_dataset(
         puzzles_fraction=puzzles_fraction,
         seed=seed,
     )
+    if game_answer_mode == "stockfish":
+        stockfish_label_pool = _StockfishBestMoveOraclePool(
+            stockfish_config,
+            num_workers=max(1, int(stockfish_num_workers)),
+        )
+        try:
+            _label_selected_game_rows_with_best_moves(
+                mixed_rows,
+                get_best_move=stockfish_label_pool.get_best_move,
+                num_workers=max(1, int(stockfish_num_workers)),
+            )
+        finally:
+            stockfish_label_pool.close()
     logger.info("hf-chess-mix: mixed final dataset rows=%d", len(mixed_rows))
     dataset = Dataset.from_list(mixed_rows)
     if shuffle:
@@ -1289,6 +1431,7 @@ def load_environment(
         game_positions_per_game=game_positions_per_game,
         game_answer_mode=game_answer_mode,
         stockfish_config=stockfish_config,
+        stockfish_num_workers=stockfish_num_workers,
         shuffle=shuffle,
     )
 

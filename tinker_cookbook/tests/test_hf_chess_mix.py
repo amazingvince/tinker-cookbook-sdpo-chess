@@ -17,6 +17,7 @@ from tinker_cookbook.recipes.verifiers_rl.hf_chess_mix import (  # noqa: E402
     _assemble_mixed_examples,
     _extract_first_uci,
     _game_quality_from_verification,
+    _label_selected_game_rows_with_best_moves,
     _parse_game_row,
     _parse_puzzle_row,
     _pv_motif_overlap,
@@ -342,3 +343,63 @@ def test_assemble_mixed_examples_backfills_short_source():
     assert sorted(row["example_id"] for row in mixed) == [0, 1, 2, 3]
     assert sum(1 for row in mixed if row["info"]["source"] == "puzzle") == 1
     assert sum(1 for row in mixed if row["info"]["source"] == "game") == 3
+
+
+def test_label_selected_game_rows_with_best_moves_labels_only_games_and_dedupes_fens():
+    fen_1 = chess.STARTING_FEN
+    board = chess.Board(fen_1)
+    board.push(chess.Move.from_uci("e2e4"))
+    fen_2 = board.fen()
+    rows = [
+        {
+            "task": "chess_next_move",
+            "prompt": [],
+            "answer": "e2e4",
+            "info": {"source": "lichess_game", "fen": fen_1, "game_answer_mode": "pgn"},
+        },
+        {
+            "task": "chess_next_move",
+            "prompt": [],
+            "answer": "d7d5",
+            "info": {"source": "lichess_game", "fen": fen_1, "game_answer_mode": "pgn"},
+        },
+        {
+            "task": "chess_next_move",
+            "prompt": [],
+            "answer": "e2e4",
+            "info": {"source": "lichess_puzzle", "fen": fen_1},
+        },
+        {
+            "task": "chess_next_move",
+            "prompt": [],
+            "answer": "e7e5",
+            "info": {"source": "lichess_game", "fen": fen_2, "game_answer_mode": "pgn"},
+        },
+    ]
+    calls: list[str] = []
+
+    def _fake_best_move_lookup(fen: str) -> tuple[str, float | None] | None:
+        calls.append(fen)
+        if fen == fen_1:
+            return ("g1f3", 0.56)
+        return None
+
+    labeled, skipped = _label_selected_game_rows_with_best_moves(
+        rows,
+        get_best_move=_fake_best_move_lookup,
+        num_workers=4,
+    )
+    assert labeled == 2
+    assert skipped == 1
+    assert set(calls) == {fen_1, fen_2}
+    assert len(calls) == 2
+    assert rows[0]["answer"] == "g1f3"
+    assert rows[1]["answer"] == "g1f3"
+    assert rows[0]["info"]["game_answer_mode"] == "stockfish"
+    assert rows[1]["info"]["game_answer_mode"] == "stockfish"
+    assert rows[0]["info"]["stockfish_best_move"] == "g1f3"
+    assert rows[1]["info"]["stockfish_best_move"] == "g1f3"
+    assert rows[2]["answer"] == "e2e4"
+    assert rows[2]["info"]["source"] == "lichess_puzzle"
+    assert rows[3]["answer"] == "e7e5"
+    assert rows[3]["info"]["game_answer_mode"] == "pgn"
