@@ -32,7 +32,31 @@ Most unrelated cookbook recipes/docs have been removed to keep this repo focused
 uv sync
 ```
 
-3. Run SDPO training:
+3. Run an end-to-end real training job (recommended):
+
+```bash
+./run_real_sdpo_chess.sh
+```
+
+The script will:
+- sync dependencies;
+- optionally run tests;
+- install/reuse Stockfish;
+- optionally install Syzygy 3-5 tablebases;
+- autotune Stockfish workers/threads/hash;
+- launch SDPO training on `hf-chess-mix` with on-policy updates (`updates_per_batch=1`).
+
+Common overrides:
+
+```bash
+MODEL_NAME=Qwen/Qwen3-30B-A3B TRAIN_STEPS=300 WANDB_PROJECT=your_project ./run_real_sdpo_chess.sh
+```
+
+```bash
+RUN_TESTS=0 INSTALL_SYZYGY=0 ./run_real_sdpo_chess.sh
+```
+
+4. Run SDPO training manually:
 
 ```bash
 python -m tinker_cookbook.recipes.verifiers_rl.sdpo_train \
