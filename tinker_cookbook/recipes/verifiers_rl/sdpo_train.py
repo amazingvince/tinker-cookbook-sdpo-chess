@@ -25,6 +25,10 @@ class CLIConfig:
     vf_env_args: str | None = None  # JSON string
     dataset_n: int = -1
     dataset_seed: int | None = None
+    dataset_buffer_size: int = -1
+    dataset_num_batches: int = -1
+    dataset_sample_with_replacement: bool = False
+    dataset_refresh_rows_per_batch: int = 0
 
     # training hyperparameters
     group_size: int = 8
@@ -155,6 +159,10 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
         groups_per_batch=cli_config.groups_per_batch,
         dataset_n=cli_config.dataset_n,
         dataset_seed=cli_config.dataset_seed,
+        dataset_buffer_size=cli_config.dataset_buffer_size,
+        dataset_num_batches=cli_config.dataset_num_batches,
+        dataset_sample_with_replacement=cli_config.dataset_sample_with_replacement,
+        dataset_refresh_rows_per_batch=cli_config.dataset_refresh_rows_per_batch,
     )
 
     cfg = sdpo_train.Config(

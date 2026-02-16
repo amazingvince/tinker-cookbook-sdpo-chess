@@ -33,9 +33,14 @@ fi
 : "${GROUPS_PER_BATCH:=32}"
 : "${GROUP_SIZE:=4}"
 : "${TRAIN_STEPS:=200}"
-: "${DATASET_N:=$((GROUPS_PER_BATCH * TRAIN_STEPS))}"
+: "${DATASET_N:=-1}"
 : "${DATASET_SEED:=0}"
-: "${MAX_EXAMPLES:=${DATASET_N}}"
+: "${BUFFER_SIZE:=5000}"
+: "${BUFFER_SOURCE_POOL_SIZE:=20000}"
+: "${DATASET_NUM_BATCHES:=${TRAIN_STEPS}}"
+: "${DATASET_SAMPLE_WITH_REPLACEMENT:=true}"
+: "${DATASET_REFRESH_ROWS_PER_BATCH:=128}"
+: "${MAX_EXAMPLES:=${BUFFER_SOURCE_POOL_SIZE}}"
 : "${MAX_TOKENS:=512}"
 : "${TEMPERATURE:=1.0}"
 : "${LEARNING_RATE:=1e-5}"
@@ -52,10 +57,10 @@ fi
 : "${STOCKFISH_SYMLINK_PATH:=$HOME/.local/bin/stockfish}"
 : "${STOCKFISH_OVERWRITE:=false}"
 : "${STOCKFISH_CACHE_DIR:=$HOME/.cache/tinker-cookbook/stockfish-cache}"
-: "${RESERVE_CPU_FRACTION:=0.15}"
-: "${RESERVE_CPU_MIN:=8}"
-: "${MAX_WORKERS:=64}"
-: "${PREFERRED_THREADS_PER_WORKER:=3}"
+: "${RESERVE_CPU_FRACTION:=0.0}"
+: "${RESERVE_CPU_MIN:=0}"
+: "${MAX_WORKERS:=180}"
+: "${PREFERRED_THREADS_PER_WORKER:=1}"
 : "${HASH_BUDGET_FRACTION:=0.35}"
 : "${HINT_STOCKFISH_DEPTH:=14}"
 : "${HINT_STOCKFISH_MULTIPV:=5}"
@@ -118,7 +123,11 @@ echo "$stockfish_install_output"
 
 detected_stockfish_path="$(printf '%s\n' "$stockfish_install_output" | awk -F= '/stockfish_path=/{print $2}' | tail -n1 | xargs || true)"
 if [[ -n "${STOCKFISH_PATH:-}" ]]; then
-  detected_stockfish_path="$STOCKFISH_PATH"
+  if [[ -x "$STOCKFISH_PATH" ]]; then
+    detected_stockfish_path="$STOCKFISH_PATH"
+  else
+    echo "Warning: ignoring invalid STOCKFISH_PATH from environment: ${STOCKFISH_PATH}" >&2
+  fi
 fi
 if [[ -z "$detected_stockfish_path" && -x "$STOCKFISH_SYMLINK_PATH" ]]; then
   detected_stockfish_path="$STOCKFISH_SYMLINK_PATH"
@@ -128,6 +137,10 @@ if [[ -z "$detected_stockfish_path" ]]; then
   exit 1
 fi
 STOCKFISH_PATH="$detected_stockfish_path"
+if [[ ! -x "$STOCKFISH_PATH" ]]; then
+  echo "Resolved STOCKFISH_PATH is not executable: ${STOCKFISH_PATH}" >&2
+  exit 1
+fi
 
 if [[ "$INSTALL_SYZYGY" == "1" ]]; then
   echo "==> Installing or updating Syzygy tablebases (pieces=${SYZYGY_PIECES})"
@@ -161,7 +174,8 @@ autotune_json="$(
 echo "$autotune_json"
 
 export AUTOTUNE_JSON="$autotune_json"
-read -r SF_NUM_WORKERS SF_THREADS SF_HASH_MB SF_ANALYSIS_SEC SF_VERIFY_RATE <<<"$(
+# Global IFS omits spaces, so force a local space delimiter for this parse.
+IFS=' ' read -r SF_NUM_WORKERS SF_THREADS SF_HASH_MB SF_ANALYSIS_SEC SF_VERIFY_RATE <<<"$(
   uv run python - <<'PY'
 import json
 import os
@@ -255,6 +269,7 @@ echo "==> Launching SDPO chess run"
 echo "run_name=${run_name}"
 echo "log_path=${LOG_PATH}"
 echo "model_name=${MODEL_NAME}"
+echo "buffer_size=${BUFFER_SIZE} source_pool=${MAX_EXAMPLES} num_batches=${DATASET_NUM_BATCHES}"
 echo "stockfish_path=${STOCKFISH_PATH}"
 echo "stockfish_num_workers=${SF_NUM_WORKERS} stockfish_threads=${SF_THREADS} stockfish_hash_mb=${SF_HASH_MB}"
 if [[ -n "$SYZYGY_DIR" ]]; then
@@ -269,6 +284,10 @@ train_cmd=(
   "vf_env_args=${vf_env_args}"
   "dataset_n=${DATASET_N}"
   "dataset_seed=${DATASET_SEED}"
+  "dataset_buffer_size=${BUFFER_SIZE}"
+  "dataset_num_batches=${DATASET_NUM_BATCHES}"
+  "dataset_sample_with_replacement=${DATASET_SAMPLE_WITH_REPLACEMENT}"
+  "dataset_refresh_rows_per_batch=${DATASET_REFRESH_ROWS_PER_BATCH}"
   "groups_per_batch=${GROUPS_PER_BATCH}"
   "group_size=${GROUP_SIZE}"
   "model_name=${MODEL_NAME}"

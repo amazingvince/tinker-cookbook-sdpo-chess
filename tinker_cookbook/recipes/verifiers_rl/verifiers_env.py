@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextvars import ContextVar
+import random
 from typing import Sequence
 
 import chz
@@ -83,31 +84,78 @@ class VerifiersRLDataset(RLDataset):
         rows: list[dict],
         vf_env: vf.Environment,
         groups_per_batch: int,
+        *,
+        source_rows: list[dict] | None = None,
+        sample_with_replacement: bool = False,
+        num_batches: int = -1,
+        refresh_rows_per_batch: int = 0,
+        rng_seed: int | None = None,
     ):
-        self.rows = rows
+        if groups_per_batch <= 0:
+            raise ValueError(f"groups_per_batch must be >= 1, got {groups_per_batch}")
+        if num_batches == 0 or num_batches < -1:
+            raise ValueError(f"num_batches must be -1 or >= 1, got {num_batches}")
+        if refresh_rows_per_batch < 0:
+            raise ValueError(f"refresh_rows_per_batch must be >= 0, got {refresh_rows_per_batch}")
+
+        self._buffer_rows = list(rows)
+        self._source_rows = list(source_rows) if source_rows is not None else list(rows)
         self.vf_env = vf_env
         self.groups_per_batch = groups_per_batch
+        self.sample_with_replacement = bool(sample_with_replacement)
+        self.num_batches = int(num_batches)
+        self.refresh_rows_per_batch = int(refresh_rows_per_batch)
+        self._rng = random.Random(rng_seed)
 
     def __len__(self) -> int:
-        return (len(self.rows) + self.groups_per_batch - 1) // self.groups_per_batch
+        if self.num_batches > 0:
+            return self.num_batches
+        return (len(self._buffer_rows) + self.groups_per_batch - 1) // self.groups_per_batch
+
+    def _refresh_buffer(self) -> None:
+        if self.refresh_rows_per_batch <= 0:
+            return
+        if not self._buffer_rows:
+            return
+        if len(self._source_rows) <= len(self._buffer_rows):
+            return
+
+        num_to_refresh = min(self.refresh_rows_per_batch, len(self._buffer_rows))
+        for _ in range(num_to_refresh):
+            dst_idx = self._rng.randrange(len(self._buffer_rows))
+            src_row = self._source_rows[self._rng.randrange(len(self._source_rows))]
+            self._buffer_rows[dst_idx] = src_row
+
+    @staticmethod
+    def _make_builder_from_row(vf_env: vf.Environment, row: dict) -> EnvGroupBuilder:
+        info = row.get("info", {})
+        info_payload = dict(info) if isinstance(info, dict) else info
+        return VerifiersEnvGroupBuilder(
+            vf_env=vf_env,
+            prompt=row["prompt"],
+            example_id=row["example_id"],
+            task=row["task"],
+            answer=row.get("answer", ""),
+            info=info_payload,
+        )
 
     def get_batch(self, index: int) -> Sequence[EnvGroupBuilder]:
+        if not self._buffer_rows:
+            return []
+
+        if self.sample_with_replacement:
+            selected_rows = [
+                self._buffer_rows[self._rng.randrange(len(self._buffer_rows))]
+                for _ in range(self.groups_per_batch)
+            ]
+            self._refresh_buffer()
+            return [self._make_builder_from_row(self.vf_env, row) for row in selected_rows]
+
         start = index * self.groups_per_batch
-        end = min(len(self.rows), start + self.groups_per_batch)
-        builders: list[EnvGroupBuilder] = []
-        for j in range(start, end):
-            row = self.rows[j]
-            builders.append(
-                VerifiersEnvGroupBuilder(
-                    vf_env=self.vf_env,
-                    prompt=row["prompt"],
-                    example_id=row["example_id"],
-                    task=row["task"],
-                    answer=row.get("answer", ""),
-                    info=row.get("info", {}),
-                )
-            )
-        return builders
+        end = min(len(self._buffer_rows), start + self.groups_per_batch)
+        selected_rows = self._buffer_rows[start:end]
+        self._refresh_buffer()
+        return [self._make_builder_from_row(self.vf_env, row) for row in selected_rows]
 
 
 @chz.chz
@@ -117,14 +165,32 @@ class VerifiersRLDatasetBuilder(RLDatasetBuilder):
     groups_per_batch: int = 32
     dataset_n: int = -1
     dataset_seed: int | None = None
+    dataset_buffer_size: int = -1
+    dataset_num_batches: int = -1
+    dataset_sample_with_replacement: bool = False
+    dataset_refresh_rows_per_batch: int = 0
 
     async def __call__(self) -> tuple[RLDataset, RLDataset | None]:
+        if self.dataset_buffer_size == 0 or self.dataset_buffer_size < -1:
+            raise ValueError(
+                f"dataset_buffer_size must be -1 or >= 1, got {self.dataset_buffer_size}"
+            )
+        if self.dataset_num_batches == 0 or self.dataset_num_batches < -1:
+            raise ValueError(
+                f"dataset_num_batches must be -1 or >= 1, got {self.dataset_num_batches}"
+            )
+        if self.dataset_refresh_rows_per_batch < 0:
+            raise ValueError(
+                "dataset_refresh_rows_per_batch must be >= 0, got "
+                f"{self.dataset_refresh_rows_per_batch}"
+            )
+
         vf_env = get_vf_env()
         if vf_env is None:
             vf_env = vf.load_environment(self.vf_env_id, **self.vf_env_args)
             set_vf_env(vf_env)
         ds = vf_env.get_dataset(n=self.dataset_n, seed=self.dataset_seed)
-        rows = [
+        source_rows = [
             {
                 "prompt": ds["prompt"][i],
                 "example_id": ds["example_id"][i],
@@ -134,7 +200,24 @@ class VerifiersRLDatasetBuilder(RLDatasetBuilder):
             }
             for i in range(len(ds))
         ]
-        return VerifiersRLDataset(rows, vf_env, self.groups_per_batch), None
+        if self.dataset_buffer_size > 0:
+            rows = source_rows[: min(self.dataset_buffer_size, len(source_rows))]
+        else:
+            rows = source_rows
+
+        return (
+            VerifiersRLDataset(
+                rows=rows,
+                source_rows=source_rows,
+                vf_env=vf_env,
+                groups_per_batch=self.groups_per_batch,
+                sample_with_replacement=self.dataset_sample_with_replacement,
+                num_batches=self.dataset_num_batches,
+                refresh_rows_per_batch=self.dataset_refresh_rows_per_batch,
+                rng_seed=self.dataset_seed,
+            ),
+            None,
+        )
 
 
 class VerifiersEnvGroupBuilder(EnvGroupBuilder):

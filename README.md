@@ -56,6 +56,18 @@ MODEL_NAME=Qwen/Qwen3-30B-A3B TRAIN_STEPS=300 WANDB_PROJECT=your_project ./run_r
 RUN_TESTS=0 INSTALL_SYZYGY=0 ./run_real_sdpo_chess.sh
 ```
 
+Rolling-buffer overrides (few-thousand active positions with refresh):
+
+```bash
+BUFFER_SIZE=5000 BUFFER_SOURCE_POOL_SIZE=20000 DATASET_NUM_BATCHES=400 DATASET_REFRESH_ROWS_PER_BATCH=128 ./run_real_sdpo_chess.sh
+```
+
+180-CPU node overrides (use all CPUs for Stockfish workers):
+
+```bash
+RESERVE_CPU_FRACTION=0 RESERVE_CPU_MIN=0 MAX_WORKERS=180 PREFERRED_THREADS_PER_WORKER=1 ./run_real_sdpo_chess.sh
+```
+
 4. Run SDPO training manually:
 
 ```bash
