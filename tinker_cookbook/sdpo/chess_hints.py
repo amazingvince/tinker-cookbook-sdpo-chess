@@ -5,6 +5,7 @@ import logging
 import os
 import random
 import re
+from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
@@ -113,6 +114,11 @@ class StockfishHintConfig:
     syzygy_path: str | None = None
     syzygy_max_pieces: int = 7
     unknown_score_cp_loss: float = 80.0
+    analysis_time_limit_sec: float | None = None
+    engine_max_retries: int = 1
+    max_root_cache_entries: int = 8192
+    max_move_cache_entries: int = 32768
+    max_verification_cache_entries: int = 65536
 
 
 @dataclass(frozen=True)
@@ -765,12 +771,32 @@ class StockfishHintExtractor:
                 "Install `python-chess` to enable enable_stockfish_hints."
             )
         self.config = config
-        self._engine = chess.engine.SimpleEngine.popen_uci(config.stockfish_path)
-        self._root_analysis_cache: dict[tuple[str, int, int], list[Mapping[str, Any]]] = {}
-        self._move_analysis_cache: dict[tuple[str, int, str], Mapping[str, Any]] = {}
+        self._engine = self._create_engine()
+        self._root_analysis_cache: OrderedDict[
+            tuple[str, int, int], list[Mapping[str, Any]]
+        ] = OrderedDict()
+        self._move_analysis_cache: OrderedDict[
+            tuple[str, int, str], Mapping[str, Any]
+        ] = OrderedDict()
+        self._verification_cache: OrderedDict[
+            tuple[str, int, str | None, float], MoveVerification
+        ] = OrderedDict()
         self._tablebase: Any | None = None
         self._configure_engine()
         self._tablebase = self._open_tablebase(config.syzygy_path)
+
+    def _create_engine(self) -> Any:
+        if chess is None:
+            raise RuntimeError("python-chess is required for Stockfish hint extraction")
+        return chess.engine.SimpleEngine.popen_uci(self.config.stockfish_path)
+
+    def _restart_engine(self) -> None:
+        try:
+            self._engine.quit()
+        except Exception:
+            pass
+        self._engine = self._create_engine()
+        self._configure_engine()
 
     def _configure_engine(self) -> None:
         options = {
@@ -846,30 +872,94 @@ class StockfishHintExtractor:
             return [info for info in raw_infos if isinstance(info, Mapping)]
         return []
 
+    @staticmethod
+    def _cache_get(cache: OrderedDict[Any, Any], key: Any) -> Any | None:
+        value = cache.get(key)
+        if value is not None:
+            cache.move_to_end(key)
+        return value
+
+    @staticmethod
+    def _cache_set(
+        cache: OrderedDict[Any, Any],
+        key: Any,
+        value: Any,
+        max_entries: int,
+    ) -> None:
+        limit = max(1, int(max_entries))
+        cache[key] = value
+        cache.move_to_end(key)
+        while len(cache) > limit:
+            cache.popitem(last=False)
+
+    def _build_analysis_limit(self, depth: int) -> Any:
+        if chess is None:
+            raise RuntimeError("python-chess is required for Stockfish hint extraction")
+        time_limit = self.config.analysis_time_limit_sec
+        if time_limit is not None and time_limit > 0:
+            return chess.engine.Limit(depth=depth, time=float(time_limit))
+        return chess.engine.Limit(depth=depth)
+
+    def _safe_analyse(
+        self,
+        board: Any,
+        depth: int,
+        multipv: int,
+        root_moves: list[Any] | None = None,
+    ) -> Any:
+        retries = max(0, int(self.config.engine_max_retries))
+        total_attempts = retries + 1
+        last_exc: Exception | None = None
+        for attempt in range(total_attempts):
+            try:
+                kwargs: dict[str, Any] = {
+                    "limit": self._build_analysis_limit(depth),
+                    "multipv": max(1, multipv),
+                }
+                if root_moves is not None:
+                    kwargs["root_moves"] = root_moves
+                return self._engine.analyse(board, **kwargs)
+            except Exception as exc:
+                last_exc = exc
+                logger.warning(
+                    "Stockfish analyse failed (attempt %d/%d): %s",
+                    attempt + 1,
+                    total_attempts,
+                    exc,
+                )
+                if attempt < total_attempts - 1:
+                    self._restart_engine()
+        raise RuntimeError("Stockfish analyse failed after retries") from last_exc
+
     def _analyze_root_infos(self, board: Any, depth: int, multipv: int) -> list[Mapping[str, Any]]:
         cache_key = (board.fen(), depth, multipv)
-        cached = self._root_analysis_cache.get(cache_key)
+        cached = self._cache_get(self._root_analysis_cache, cache_key)
         if cached is not None:
             return cached
 
-        raw_infos = self._engine.analyse(
-            board,
-            limit=chess.engine.Limit(depth=depth),
-            multipv=max(1, multipv),
+        raw_infos = self._safe_analyse(
+            board=board,
+            depth=depth,
+            multipv=multipv,
         )
         infos = self._normalize_infos(raw_infos)
-        self._root_analysis_cache[cache_key] = infos
+        self._cache_set(
+            self._root_analysis_cache,
+            cache_key,
+            infos,
+            max_entries=self.config.max_root_cache_entries,
+        )
         return infos
 
     def _analyze_move_info(self, board: Any, move: Any, depth: int) -> Mapping[str, Any] | None:
         cache_key = (board.fen(), depth, move.uci())
-        cached = self._move_analysis_cache.get(cache_key)
+        cached = self._cache_get(self._move_analysis_cache, cache_key)
         if cached is not None:
             return cached
 
-        raw_info = self._engine.analyse(
-            board,
-            limit=chess.engine.Limit(depth=depth),
+        raw_info = self._safe_analyse(
+            board=board,
+            depth=depth,
             multipv=1,
             root_moves=[move],
         )
@@ -877,7 +967,12 @@ class StockfishHintExtractor:
         if not infos:
             return None
         info = infos[0]
-        self._move_analysis_cache[cache_key] = info
+        self._cache_set(
+            self._move_analysis_cache,
+            cache_key,
+            info,
+            max_entries=self.config.max_move_cache_entries,
+        )
         return info
 
     def analyze_fen(
@@ -1053,13 +1148,19 @@ class StockfishHintExtractor:
             raise RuntimeError("python-chess is required for Stockfish hint extraction")
 
         board = chess.Board(fen)
+        predicted_move = extract_predicted_move(board, predicted_text)
+        predicted_move_key = predicted_move.uci() if predicted_move is not None else None
+        cache_key = (fen, depth, predicted_move_key, float(illegal_move_cp_loss))
+        cached = self._cache_get(self._verification_cache, cache_key)
+        if cached is not None:
+            return cached
+
         pack = self.analyze_fen(
             fen=fen,
             depth=depth,
             multipv=max(self.config.multipv, 8),
         )
         best_move = pack.candidate_moves[0] if pack.candidate_moves else None
-        predicted_move = extract_predicted_move(board, predicted_text)
 
         best_move_uci = best_move.uci if best_move else None
         best_move_san = best_move.san if best_move else None
@@ -1105,10 +1206,17 @@ class StockfishHintExtractor:
                 syzygy_best_dtz=syzygy_best_dtz,
                 feedback_text="",
             )
-            return replace(
+            result = replace(
                 verification,
                 feedback_text=self._render_move_verification_feedback(verification),
             )
+            self._cache_set(
+                self._verification_cache,
+                cache_key,
+                result,
+                max_entries=self.config.max_verification_cache_entries,
+            )
+            return result
 
         predicted_san = board.san(predicted_move)
         predicted_hint = next(
@@ -1175,10 +1283,17 @@ class StockfishHintExtractor:
             syzygy_best_dtz=syzygy_best_dtz,
             feedback_text="",
         )
-        return replace(
+        result = replace(
             verification,
             feedback_text=self._render_move_verification_feedback(verification),
         )
+        self._cache_set(
+            self._verification_cache,
+            cache_key,
+            result,
+            max_entries=self.config.max_verification_cache_entries,
+        )
+        return result
 
 
 def pick_random_game_fen(movetext: str, seed: int | None = None) -> str | None:

@@ -66,9 +66,13 @@ Expected SDPO metrics in `metrics.jsonl`:
 - `sdpo/topk_overlap_fraction`
 - `sdpo/updates_per_batch`
 - `sdpo/stockfish_hints_enabled`
+- `sdpo/stockfish_move_verification_enabled`
+- `sdpo/stockfish_verification_sample_rate`
 - `sdpo/stockfish_verification_depth`
 - `sdpo/stockfish_hint_available_fraction`
 - `sdpo/stockfish_hint_used_fraction`
+- `sdpo/stockfish_verification_candidate_fraction`
+- `sdpo/stockfish_verification_scheduled_fraction`
 - `sdpo/stockfish_verified_fraction`
 - `sdpo/stockfish_legal_move_fraction`
 - `sdpo/stockfish_feedback_fraction`
@@ -89,6 +93,9 @@ python -m tinker_cookbook.recipes.verifiers_rl.sdpo_train \
   stockfish_depth=14 \
   stockfish_multipv=5 \
   stockfish_verification_depth=20 \
+  stockfish_verification_sample_rate=1.0 \
+  stockfish_analysis_time_limit_sec=0.2 \
+  stockfish_engine_max_retries=1 \
   include_stockfish_move_feedback=true \
   stockfish_feedback_cp_loss_threshold=20 \
   stockfish_include_fen_decode=true \

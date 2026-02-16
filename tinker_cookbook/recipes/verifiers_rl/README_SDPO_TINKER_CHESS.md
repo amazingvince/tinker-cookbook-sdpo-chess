@@ -183,6 +183,9 @@ stockfish_path=/path/to/stockfish \
 stockfish_depth=14 \
 stockfish_multipv=5 \
 stockfish_verification_depth=20 \
+stockfish_verification_sample_rate=1.0 \
+stockfish_analysis_time_limit_sec=0.2 \
+stockfish_engine_max_retries=1 \
 include_stockfish_move_feedback=true \
 stockfish_feedback_cp_loss_threshold=20 \
 stockfish_include_fen_decode=true \
@@ -196,6 +199,8 @@ Relevant metrics:
 
 - `sdpo/stockfish_hint_available_fraction`
 - `sdpo/stockfish_hint_used_fraction`
+- `sdpo/stockfish_verification_candidate_fraction`
+- `sdpo/stockfish_verification_scheduled_fraction`
 - `sdpo/stockfish_verified_fraction`
 - `sdpo/stockfish_legal_move_fraction`
 - `sdpo/stockfish_feedback_fraction`
@@ -219,6 +224,10 @@ Create panels for:
 - Log all CLI args in W&B config.
 - Keep Stockfish binary version fixed (18).
 - Keep Syzygy path/version fixed if enabled.
+- Tune Stockfish throughput:
+  - lower `stockfish_verification_sample_rate` (for example `0.25`) to verify only a deterministic subset of samples;
+  - set `stockfish_analysis_time_limit_sec` (for example `0.1`–`0.3`) to cap slow positions;
+  - keep cache limits high enough (`stockfish_max_*_cache_entries`) for your dataset reuse pattern.
 
 ## 9. Common pitfalls
 

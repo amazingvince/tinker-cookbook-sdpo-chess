@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import math
 import os
@@ -65,6 +66,8 @@ class GroupSdpoStats:
     feedback_used_samples: int = 0
     stockfish_hint_available_samples: int = 0
     stockfish_hint_used_samples: int = 0
+    stockfish_verification_candidate_samples: int = 0
+    stockfish_verification_scheduled_samples: int = 0
     stockfish_verified_samples: int = 0
     stockfish_legal_move_samples: int = 0
     stockfish_cp_loss_sum: float = 0.0
@@ -138,6 +141,11 @@ class Config:
     stockfish_include_fen_decode: bool = True
     stockfish_include_ascii_board: bool = True
     stockfish_include_search_stats: bool = True
+    stockfish_analysis_time_limit_sec: float | None = None
+    stockfish_engine_max_retries: int = 1
+    stockfish_max_root_cache_entries: int = 8192
+    stockfish_max_move_cache_entries: int = 32768
+    stockfish_max_verification_cache_entries: int = 65536
     stockfish_max_piece_pressure_items: int = 8
     stockfish_max_weak_square_items: int = 8
     stockfish_syzygy_path: str | None = None
@@ -147,6 +155,8 @@ class Config:
         "\nStockfish position hints (WDL expected score):\n\n{stockfish_hints}\n\n"
     )
     stockfish_hints_only_without_solution: bool = False
+    enable_stockfish_move_verification: bool = True
+    stockfish_verification_sample_rate: float = 1.0
     stockfish_verification_depth: int = 20
     stockfish_illegal_move_cp_loss: float = 1000.0
     include_stockfish_move_feedback: bool = True
@@ -164,6 +174,24 @@ class Config:
 
 def _parse_feedback_keys(feedback_keys_csv: str) -> list[str]:
     return [key.strip() for key in feedback_keys_csv.split(",") if key.strip()]
+
+
+def _hash_to_unit_interval(text: str) -> float:
+    digest = hashlib.sha256(text.encode("utf-8")).digest()
+    value = int.from_bytes(digest[:8], byteorder="big", signed=False)
+    return value / float(2**64)
+
+
+def _should_run_stockfish_verification(
+    sample: RolloutSample,
+    sample_rate: float,
+) -> bool:
+    if sample_rate >= 1.0:
+        return True
+    if sample_rate <= 0.0:
+        return False
+    key = f"{sample.fen or ''}|{sample.response_text}"
+    return _hash_to_unit_interval(key) < sample_rate
 
 
 def _normalize_prompt_messages(prompt_value: Any) -> list[renderers.Message]:
@@ -766,7 +794,21 @@ async def build_group_sdpo_datums(
     stockfish_hints_by_fen: dict[str, str] = {}
     datum_tasks: list[
         asyncio.Task[
-            tuple[tinker.Datum, list[float], bool, bool, bool, bool, bool, float, bool, int, int]
+            tuple[
+                tinker.Datum,
+                list[float],
+                bool,
+                bool,
+                bool,
+                bool,
+                bool,
+                float,
+                bool,
+                bool,
+                bool,
+                int,
+                int,
+            ]
         ]
     ] = []
 
@@ -814,8 +856,21 @@ async def build_group_sdpo_datums(
         stockfish_cp_loss = 0.0
         stockfish_cp_loss_estimated = False
         stockfish_feedback_used = False
-        if (
+        stockfish_verification_candidate = (
             config.enable_stockfish_hints
+            and stockfish_hint_extractor is not None
+            and sample.fen is not None
+            and config.enable_stockfish_move_verification
+        )
+        stockfish_verification_scheduled = (
+            stockfish_verification_candidate
+            and _should_run_stockfish_verification(
+                sample=sample,
+                sample_rate=config.stockfish_verification_sample_rate,
+            )
+        )
+        if (
+            stockfish_verification_scheduled
             and stockfish_hint_extractor is not None
             and sample.fen is not None
         ):
@@ -876,7 +931,9 @@ async def build_group_sdpo_datums(
             local_stockfish_cp_loss: float = stockfish_cp_loss,
             local_stockfish_cp_loss_estimated: bool = stockfish_cp_loss_estimated,
             local_stockfish_feedback_used: bool = stockfish_feedback_used,
-        ) -> tuple[tinker.Datum, list[float], bool, bool, bool, bool, bool, float, bool, int, int]:
+            local_stockfish_verification_candidate: bool = stockfish_verification_candidate,
+            local_stockfish_verification_scheduled: bool = stockfish_verification_scheduled,
+        ) -> tuple[tinker.Datum, list[float], bool, bool, bool, bool, bool, float, bool, bool, bool, int, int]:
             advantages, topk_overlap_count, topk_total_count = await _compute_sample_advantages(
                 sample=rollout_sample,
                 teacher_messages=local_teacher_messages,
@@ -919,6 +976,8 @@ async def build_group_sdpo_datums(
                 local_stockfish_cp_loss,
                 local_stockfish_cp_loss_estimated,
                 local_stockfish_feedback_used,
+                local_stockfish_verification_candidate,
+                local_stockfish_verification_scheduled,
                 topk_overlap_count,
                 topk_total_count,
             )
@@ -938,6 +997,8 @@ async def build_group_sdpo_datums(
             stockfish_cp_loss,
             stockfish_cp_loss_estimated,
             stockfish_feedback_used,
+            stockfish_verification_candidate,
+            stockfish_verification_scheduled,
             topk_overlap_count,
             topk_total_count,
         ) = await task
@@ -947,6 +1008,10 @@ async def build_group_sdpo_datums(
             stats.feedback_used_samples += 1
         if stockfish_hint_used:
             stats.stockfish_hint_used_samples += 1
+        if stockfish_verification_candidate:
+            stats.stockfish_verification_candidate_samples += 1
+        if stockfish_verification_scheduled:
+            stats.stockfish_verification_scheduled_samples += 1
         if stockfish_verified:
             stats.stockfish_verified_samples += 1
             stats.stockfish_cp_loss_sum += stockfish_cp_loss
@@ -1000,6 +1065,11 @@ async def run_sdpo_batch_update(
         raise ValueError(
             f"teacher_mix_alpha must be in (0, 1] for ema regularization, got {config.teacher_mix_alpha}"
         )
+    if not 0.0 <= config.stockfish_verification_sample_rate <= 1.0:
+        raise ValueError(
+            "stockfish_verification_sample_rate must be in [0, 1], got "
+            f"{config.stockfish_verification_sample_rate}"
+        )
     if config.full_logit_distillation and (config.distillation_topk is None or config.distillation_topk <= 0):
         raise ValueError(
             "full_logit_distillation=True requires distillation_topk to be a positive integer"
@@ -1035,6 +1105,12 @@ async def run_sdpo_batch_update(
         total_stats.feedback_used_samples += group_stats.feedback_used_samples
         total_stats.stockfish_hint_available_samples += group_stats.stockfish_hint_available_samples
         total_stats.stockfish_hint_used_samples += group_stats.stockfish_hint_used_samples
+        total_stats.stockfish_verification_candidate_samples += (
+            group_stats.stockfish_verification_candidate_samples
+        )
+        total_stats.stockfish_verification_scheduled_samples += (
+            group_stats.stockfish_verification_scheduled_samples
+        )
         total_stats.stockfish_verified_samples += group_stats.stockfish_verified_samples
         total_stats.stockfish_legal_move_samples += group_stats.stockfish_legal_move_samples
         total_stats.stockfish_cp_loss_sum += group_stats.stockfish_cp_loss_sum
@@ -1060,6 +1136,8 @@ async def run_sdpo_batch_update(
         "sdpo/full_logit_distillation": float(config.full_logit_distillation),
         "sdpo/updates_per_batch": float(config.updates_per_batch),
         "sdpo/stockfish_hints_enabled": float(config.enable_stockfish_hints),
+        "sdpo/stockfish_move_verification_enabled": float(config.enable_stockfish_move_verification),
+        "sdpo/stockfish_verification_sample_rate": float(config.stockfish_verification_sample_rate),
         "sdpo/stockfish_verification_depth": float(config.stockfish_verification_depth),
     }
 
@@ -1082,6 +1160,12 @@ async def run_sdpo_batch_update(
         metrics["sdpo/stockfish_hint_used_fraction"] = (
             total_stats.stockfish_hint_used_samples / total_stats.num_samples
         )
+        metrics["sdpo/stockfish_verification_candidate_fraction"] = (
+            total_stats.stockfish_verification_candidate_samples / total_stats.num_samples
+        )
+        metrics["sdpo/stockfish_verification_scheduled_fraction"] = (
+            total_stats.stockfish_verification_scheduled_samples / total_stats.num_samples
+        )
         metrics["sdpo/stockfish_verified_fraction"] = (
             total_stats.stockfish_verified_samples / total_stats.num_samples
         )
@@ -1101,6 +1185,8 @@ async def run_sdpo_batch_update(
         metrics["sdpo/feedback_used_fraction"] = 0.0
         metrics["sdpo/stockfish_hint_available_fraction"] = 0.0
         metrics["sdpo/stockfish_hint_used_fraction"] = 0.0
+        metrics["sdpo/stockfish_verification_candidate_fraction"] = 0.0
+        metrics["sdpo/stockfish_verification_scheduled_fraction"] = 0.0
         metrics["sdpo/stockfish_verified_fraction"] = 0.0
         metrics["sdpo/stockfish_legal_move_fraction"] = 0.0
         metrics["sdpo/stockfish_feedback_fraction"] = 0.0
@@ -1305,6 +1391,11 @@ async def main(config: Config):
                     include_fen_decode=config.stockfish_include_fen_decode,
                     include_ascii_board=config.stockfish_include_ascii_board,
                     include_search_stats=config.stockfish_include_search_stats,
+                    analysis_time_limit_sec=config.stockfish_analysis_time_limit_sec,
+                    engine_max_retries=config.stockfish_engine_max_retries,
+                    max_root_cache_entries=config.stockfish_max_root_cache_entries,
+                    max_move_cache_entries=config.stockfish_max_move_cache_entries,
+                    max_verification_cache_entries=config.stockfish_max_verification_cache_entries,
                     max_piece_pressure_items=config.stockfish_max_piece_pressure_items,
                     max_weak_square_items=config.stockfish_max_weak_square_items,
                     syzygy_path=config.stockfish_syzygy_path,

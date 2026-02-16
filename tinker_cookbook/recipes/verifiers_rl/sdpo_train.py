@@ -76,6 +76,11 @@ class CLIConfig:
     stockfish_include_fen_decode: bool = True
     stockfish_include_ascii_board: bool = True
     stockfish_include_search_stats: bool = True
+    stockfish_analysis_time_limit_sec: float | None = None
+    stockfish_engine_max_retries: int = 1
+    stockfish_max_root_cache_entries: int = 8192
+    stockfish_max_move_cache_entries: int = 32768
+    stockfish_max_verification_cache_entries: int = 65536
     stockfish_max_piece_pressure_items: int = 8
     stockfish_max_weak_square_items: int = 8
     stockfish_syzygy_path: str | None = None
@@ -85,6 +90,8 @@ class CLIConfig:
         "\nStockfish position hints (WDL expected score):\n\n{stockfish_hints}\n\n"
     )
     stockfish_hints_only_without_solution: bool = False
+    enable_stockfish_move_verification: bool = True
+    stockfish_verification_sample_rate: float = 1.0
     stockfish_verification_depth: int = 20
     stockfish_illegal_move_cp_loss: float = 1000.0
     include_stockfish_move_feedback: bool = True
@@ -178,6 +185,11 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
         stockfish_include_fen_decode=cli_config.stockfish_include_fen_decode,
         stockfish_include_ascii_board=cli_config.stockfish_include_ascii_board,
         stockfish_include_search_stats=cli_config.stockfish_include_search_stats,
+        stockfish_analysis_time_limit_sec=cli_config.stockfish_analysis_time_limit_sec,
+        stockfish_engine_max_retries=cli_config.stockfish_engine_max_retries,
+        stockfish_max_root_cache_entries=cli_config.stockfish_max_root_cache_entries,
+        stockfish_max_move_cache_entries=cli_config.stockfish_max_move_cache_entries,
+        stockfish_max_verification_cache_entries=cli_config.stockfish_max_verification_cache_entries,
         stockfish_max_piece_pressure_items=cli_config.stockfish_max_piece_pressure_items,
         stockfish_max_weak_square_items=cli_config.stockfish_max_weak_square_items,
         stockfish_syzygy_path=cli_config.stockfish_syzygy_path,
@@ -185,6 +197,8 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
         stockfish_unknown_score_cp_loss=cli_config.stockfish_unknown_score_cp_loss,
         stockfish_hints_template=cli_config.stockfish_hints_template,
         stockfish_hints_only_without_solution=cli_config.stockfish_hints_only_without_solution,
+        enable_stockfish_move_verification=cli_config.enable_stockfish_move_verification,
+        stockfish_verification_sample_rate=cli_config.stockfish_verification_sample_rate,
         stockfish_verification_depth=cli_config.stockfish_verification_depth,
         stockfish_illegal_move_cp_loss=cli_config.stockfish_illegal_move_cp_loss,
         include_stockfish_move_feedback=cli_config.include_stockfish_move_feedback,
