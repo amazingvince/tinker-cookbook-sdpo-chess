@@ -12,6 +12,7 @@ import torch
 from tinker_cookbook.recipes.verifiers_rl.tinker_openai import (
     _answer_text_after_think_blocks as _openai_answer_after_think,
     _parse_max_thinking_tokens,
+    _strip_think_stop_sequences,
     _truncate_and_close_thinking_blocks_text,
     _truncate_thinking_blocks_text,
 )
@@ -374,6 +375,13 @@ def test_openai_answer_text_after_think_blocks():
     assert _openai_answer_after_think("<think>line</think>\ne2e4") == "e2e4"
     assert _openai_answer_after_think("<think>line only") == ""
     assert _openai_answer_after_think("e2e4") == "e2e4"
+
+
+def test_strip_think_stop_sequences():
+    assert _strip_think_stop_sequences("</think>") is None
+    assert _strip_think_stop_sequences(["</think>", "<|im_end|>"]) == ["<|im_end|>"]
+    assert _strip_think_stop_sequences([1, 2, 3]) == [1, 2, 3]
+    assert _strip_think_stop_sequences(None) is None
 
 
 def test_build_sdpo_datum_alignment():

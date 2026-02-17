@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import re
 import time
+from collections.abc import Sequence
 from typing import Any, Dict, List, Literal, overload
 
 import tinker
@@ -123,6 +124,25 @@ def _answer_text_after_think_blocks(response_text: str) -> str:
     if re.search(r"<think\b", response_text, flags=re.IGNORECASE) is not None:
         return ""
     return response_text.strip()
+
+
+def _strip_think_stop_sequences(
+    stop: str | Sequence[str] | Sequence[int] | None,
+) -> str | Sequence[str] | Sequence[int] | None:
+    if stop is None:
+        return None
+    if isinstance(stop, str):
+        return None if _THINK_TAG_RE.search(stop) else stop
+    if isinstance(stop, Sequence) and not isinstance(stop, (bytes, bytearray, str)):
+        filtered: list[str | int] = []
+        for item in stop:
+            if isinstance(item, str) and _THINK_TAG_RE.search(item):
+                continue
+            filtered.append(item)
+        if not filtered:
+            return None
+        return filtered
+    return stop
 
 
 class TinkerAsyncOpenAIClient(AsyncOpenAI):
@@ -259,6 +279,7 @@ class TinkerChatCompletions(OpenAIAsyncChatCompletions):
             has_think_tag = _THINK_TAG_RE.search(completion_text) is not None
             if has_think_tag and not post_think_answer:
                 continuation_input = tinker.ModelInput.from_ints(prompt_token_ids + completion_token_ids)
+                continuation_stop = _strip_think_stop_sequences(stop)
                 continuation_sample = await self._parent.sampling_client.sample_async(
                     prompt=continuation_input,
                     num_samples=1,
@@ -267,7 +288,7 @@ class TinkerChatCompletions(OpenAIAsyncChatCompletions):
                         max_tokens=reserved_answer_tokens,
                         top_p=float(sampling_args.get("top_p", 1.0)),
                         top_k=int(sampling_args.get("top_k", -1)),
-                        stop=stop,
+                        stop=continuation_stop,
                     ),
                 )
                 continuation_tokens = continuation_sample.sequences[0].tokens
