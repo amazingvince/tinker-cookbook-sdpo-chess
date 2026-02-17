@@ -102,7 +102,8 @@ fi
 : "${WANDB_PROJECT:=sdpo-chess}"
 : "${WANDB_NAME_PREFIX:=sdpo-chess-real}"
 : "${LOG_ROOT:=$SCRIPT_DIR/runs/sdpo_chess}"
-: "${BEHAVIOR_IF_LOG_DIR_EXISTS:=resume}"
+: "${START_FRESH_RUN:=true}"
+: "${BEHAVIOR_IF_LOG_DIR_EXISTS:=raise}"
 
 mkdir -p "$LOG_ROOT"
 mkdir -p "$STOCKFISH_CACHE_DIR"
@@ -110,7 +111,13 @@ mkdir -p "$STOCKFISH_CACHE_DIR"
 model_slug="$(printf '%s' "$MODEL_NAME" | tr '/:' '__' | tr -cd '[:alnum:]_.-')"
 run_ts="$(date +%Y%m%d_%H%M%S)"
 run_name="${WANDB_NAME_PREFIX}_${model_slug}_${run_ts}"
-: "${LOG_PATH:=$LOG_ROOT/$run_name}"
+start_fresh_run_normalized="$(printf '%s' "$START_FRESH_RUN" | tr '[:upper:]' '[:lower:]')"
+if [[ "$start_fresh_run_normalized" == "1" || "$start_fresh_run_normalized" == "true" || "$start_fresh_run_normalized" == "yes" || "$start_fresh_run_normalized" == "on" ]]; then
+  LOG_PATH="$LOG_ROOT/$run_name"
+  BEHAVIOR_IF_LOG_DIR_EXISTS="raise"
+else
+  : "${LOG_PATH:=$LOG_ROOT/$run_name}"
+fi
 
 echo "==> Syncing Python dependencies"
 uv sync --extra verifiers --extra chess --extra wandb
@@ -288,6 +295,7 @@ PY
 echo "==> Launching SDPO chess run"
 echo "run_name=${run_name}"
 echo "log_path=${LOG_PATH}"
+echo "start_fresh_run=${START_FRESH_RUN}"
 echo "model_name=${MODEL_NAME}"
 echo "buffer_size=${BUFFER_SIZE} source_pool=${MAX_EXAMPLES} num_batches=${DATASET_NUM_BATCHES}"
 echo "stockfish_path=${STOCKFISH_PATH}"
