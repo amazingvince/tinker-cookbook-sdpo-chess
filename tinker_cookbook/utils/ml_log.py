@@ -86,7 +86,7 @@ class Logger(ABC):
         """Log metrics dictionary with optional step number."""
         pass
 
-    def log_long_text(self, key: str, text: str) -> None:
+    def log_long_text(self, key: str, text: str, step: int | None = None) -> None:
         """Log long text content (optional to implement)."""
         pass
 
@@ -144,11 +144,14 @@ class JsonLogger(Logger):
             f.write(json.dumps(log_entry) + "\n")
             logger.info("Wrote metrics to %s", self.metrics_file)
 
-    def log_long_text(self, key: str, text: str) -> None:
+    def log_long_text(self, key: str, text: str, step: int | None = None) -> None:
         """Append long text logs to a sidecar JSONL file."""
         long_text_file = self.log_dir / "long_text.jsonl"
+        log_entry = {"key": key, "text": text}
+        if step is not None:
+            log_entry["step"] = step
         with open(long_text_file, "a", encoding="utf-8") as f:
-            f.write(json.dumps({"key": key, "text": text}, ensure_ascii=True) + "\n")
+            f.write(json.dumps(log_entry, ensure_ascii=True) + "\n")
         logger.info("Wrote long text log to %s", long_text_file)
 
 
@@ -189,9 +192,11 @@ class PrettyPrintLogger(Logger):
         with _rich_console_use_logger(self.console):
             self.console.print(table)
 
-    def log_long_text(self, key: str, text: str) -> None:
+    def log_long_text(self, key: str, text: str, step: int | None = None) -> None:
         """Display long text logs in console."""
         with _rich_console_use_logger(self.console):
+            if step is not None:
+                self.console.print(f"[bold magenta]Step {step}[/bold magenta]")
             self.console.print(f"[bold cyan]{key}[/bold cyan]")
             self.console.print(text)
 
@@ -238,6 +243,9 @@ class WandbLogger(Logger):
             dir=str(log_dir) if log_dir else None,
             name=wandb_name,
         )
+        self._sdpo_debug_examples_table = wandb.Table(
+            columns=["step", "key", "text"],
+        )
 
     def log_hparams(self, config: Any) -> None:
         """Log hyperparameters to wandb."""
@@ -250,10 +258,24 @@ class WandbLogger(Logger):
             wandb.log(metrics, step=step)
             logger.info("Logging to: %s", self.run.url)
 
-    def log_long_text(self, key: str, text: str) -> None:
+    def log_long_text(self, key: str, text: str, step: int | None = None) -> None:
         """Log long text to wandb as a string field."""
         if self.run and wandb is not None:
-            wandb.log({key: text})
+            if step is None:
+                wandb.log({key: text})
+            else:
+                wandb.log({key: text}, step=step)
+
+            if key.startswith("sdpo/debug_examples/batch_"):
+                self._sdpo_debug_examples_table.add_data(-1 if step is None else step, key, text)
+                table_payload = {
+                    "sdpo/debug_examples/table": self._sdpo_debug_examples_table,
+                    "sdpo/debug_examples/latest": text,
+                }
+                if step is None:
+                    wandb.log(table_payload)
+                else:
+                    wandb.log(table_payload, step=step)
 
     def close(self) -> None:
         """Close wandb run."""
@@ -373,11 +395,11 @@ class MultiplexLogger(Logger):
         for logger in self.loggers:
             logger.log_metrics(metrics, step)
 
-    def log_long_text(self, key: str, text: str) -> None:
+    def log_long_text(self, key: str, text: str, step: int | None = None) -> None:
         """Forward log_long_text to all child loggers."""
         for logger in self.loggers:
             if hasattr(logger, "log_long_text"):
-                logger.log_long_text(key, text)
+                logger.log_long_text(key, text, step)
 
     def close(self) -> None:
         """Close all child loggers."""

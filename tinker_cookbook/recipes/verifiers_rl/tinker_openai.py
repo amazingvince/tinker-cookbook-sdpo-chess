@@ -27,6 +27,7 @@ from tinker_cookbook import renderers
 from tinker_cookbook.tokenizer_utils import Tokenizer
 
 _THINK_BLOCK_RE = re.compile(r"(<think>)(.*?)(</think>)", flags=re.DOTALL)
+_THINK_TAG_RE = re.compile(r"<think\b[^>]*>|</think\s*>", flags=re.IGNORECASE)
 
 
 def _parse_max_thinking_tokens(value: Any) -> int:
@@ -61,6 +62,54 @@ def _truncate_thinking_blocks_text(
 
     new_text = _THINK_BLOCK_RE.sub(_replace, text)
     return new_text, changed
+
+
+def _truncate_and_close_thinking_blocks_text(
+    text: str,
+    tokenizer: Tokenizer,
+    max_thinking_tokens: int,
+) -> tuple[str, bool]:
+    """
+    Bound thinking tokens and force-close an unterminated <think> block.
+
+    If a response ends inside <think>...</think> without a closing tag, truncate the
+    remaining thinking content to max_thinking_tokens and append </think>.
+    """
+    bounded_text, changed = _truncate_thinking_blocks_text(
+        text=text,
+        tokenizer=tokenizer,
+        max_thinking_tokens=max_thinking_tokens,
+    )
+    if max_thinking_tokens <= 0:
+        return bounded_text, changed
+
+    depth = 0
+    unmatched_open_body_start: int | None = None
+    for match in _THINK_TAG_RE.finditer(bounded_text):
+        token = match.group(0).strip().lower()
+        if token.startswith("</think"):
+            if depth > 0:
+                depth -= 1
+            if depth == 0:
+                unmatched_open_body_start = None
+            continue
+
+        if depth == 0:
+            unmatched_open_body_start = match.end()
+        depth += 1
+
+    if depth <= 0 or unmatched_open_body_start is None:
+        return bounded_text, changed
+
+    trailing_body = bounded_text[unmatched_open_body_start:]
+    trailing_ids = tokenizer.encode(trailing_body, add_special_tokens=False)
+    if len(trailing_ids) > max_thinking_tokens:
+        trailing_body = tokenizer.decode(
+            trailing_ids[:max_thinking_tokens],
+            skip_special_tokens=False,
+        )
+    closed_text = f"{bounded_text[:unmatched_open_body_start]}{trailing_body}</think>"
+    return closed_text, True
 
 
 class TinkerAsyncOpenAIClient(AsyncOpenAI):
@@ -143,7 +192,7 @@ class TinkerChatCompletions(OpenAIAsyncChatCompletions):
             completion_text = self._parent.tokenizer.decode(
                 completion_token_ids, skip_special_tokens=False
             )
-            bounded_text, was_truncated = _truncate_thinking_blocks_text(
+            bounded_text, was_truncated = _truncate_and_close_thinking_blocks_text(
                 completion_text,
                 tokenizer=self._parent.tokenizer,
                 max_thinking_tokens=max_thinking_tokens,

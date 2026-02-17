@@ -162,7 +162,7 @@ python -m tinker_cookbook.recipes.verifiers_rl.sdpo_train \
   stockfish_multipv=5 \
   stockfish_num_workers=16 \
   stockfish_threads=2 \
-  student_max_thinking_tokens=256 \
+  student_max_thinking_tokens=2000 \
   stockfish_verification_depth=20 \
   stockfish_verification_sample_rate=1.0 \
   stockfish_analysis_time_limit_sec=0.2 \
@@ -217,7 +217,10 @@ python -m tinker_cookbook.recipes.verifiers_rl.sdpo_train \
 
 This writes JSONL records to `<log_path>/sdpo_debug_examples.jsonl` (or your configured file name),
 adds `sdpo/debug_examples_logged` to `metrics.jsonl`, and also emits long-form text snapshots into
-`<log_path>/long_text.jsonl` (plus W&B text logs if W&B is enabled).
+`<log_path>/long_text.jsonl`. With W&B enabled, snapshots are mirrored to:
+
+- `sdpo/debug_examples/latest` (latest batch text dump),
+- `sdpo/debug_examples/table` (accumulated rollout/debug text table).
 
 To create a starter JSONL dataset of random FENs from Lichess puzzles + games:
 

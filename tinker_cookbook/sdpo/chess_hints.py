@@ -34,6 +34,9 @@ if chess is not None:  # pragma: no branch
         pass
 
 logger = logging.getLogger(__name__)
+_INIT_LOG_LOCK = threading.Lock()
+_LOGGED_PERSISTENT_CACHE_PATHS: set[str] = set()
+_LOGGED_SYZYGY_PATH_SETS: set[tuple[str, ...]] = set()
 
 _FEN_RE = re.compile(
     r"((?:[pnbrqkPNBRQK1-8]{1,8}/){7}[pnbrqkPNBRQK1-8]{1,8}\s[wb]\s(?:-|[KQkq]{1,4})\s(?:-|[a-h][36])\s\d+\s\d+)"
@@ -910,6 +913,24 @@ class StockfishHintExtractor:
             self._tablebase = None
 
     @staticmethod
+    def _log_once_persistent_cache_enabled(db_path: str) -> None:
+        normalized = os.path.abspath(db_path)
+        with _INIT_LOG_LOCK:
+            if normalized in _LOGGED_PERSISTENT_CACHE_PATHS:
+                return
+            _LOGGED_PERSISTENT_CACHE_PATHS.add(normalized)
+        logger.info("Enabled persistent Stockfish cache at %s", normalized)
+
+    @staticmethod
+    def _log_once_syzygy_loaded(paths: Sequence[str]) -> None:
+        normalized_paths = tuple(os.path.abspath(path) for path in paths)
+        with _INIT_LOG_LOCK:
+            if normalized_paths in _LOGGED_SYZYGY_PATH_SETS:
+                return
+            _LOGGED_SYZYGY_PATH_SETS.add(normalized_paths)
+        logger.info("Loaded Syzygy tablebase from %s", ", ".join(normalized_paths))
+
+    @staticmethod
     def _build_persistent_key_prefix(config: StockfishHintConfig) -> str:
         cache_signature = {
             "schema": 2,
@@ -971,7 +992,7 @@ class StockfishHintExtractor:
                 """
             )
             conn.commit()
-            logger.info("Enabled persistent Stockfish cache at %s", db_path)
+            self._log_once_persistent_cache_enabled(db_path)
             return conn
         except Exception as exc:
             logger.warning("Failed to open persistent Stockfish cache at %s: %s", cache_dir, exc)
@@ -1039,7 +1060,7 @@ class StockfishHintExtractor:
             tablebase = chess.syzygy.open_tablebase(paths[0])
             for extra_path in paths[1:]:
                 tablebase.add_directory(extra_path)
-            logger.info("Loaded Syzygy tablebase from %s", ", ".join(paths))
+            self._log_once_syzygy_loaded(paths)
             return tablebase
         except Exception as exc:
             logger.warning("Failed to load Syzygy tablebase from %s: %s", ", ".join(paths), exc)

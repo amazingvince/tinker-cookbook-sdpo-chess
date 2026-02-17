@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import os
+import re
 import time
 from collections import deque
 from collections.abc import Mapping, Sequence
@@ -41,6 +42,8 @@ from tinker_cookbook.utils.misc_utils import timed
 logger = logging.getLogger(__name__)
 
 _REFERENCE_SAMPLER_FILE = "sdpo_reference_sampler_path.txt"
+_THINK_OPEN_RE = re.compile(r"<think\b", flags=re.IGNORECASE)
+_THINK_CLOSE_RE = re.compile(r"</think\s*>", flags=re.IGNORECASE)
 
 
 class MultiTurnStateError(ValueError):
@@ -134,7 +137,9 @@ class Config:
     reprompt_template: str = (
         "{prompt}{solution}{feedback}{hints}\n"
         "Use the additional context above only as private guidance.\n"
-        "Now answer the original question in your own style.\n"
+        "Now answer the original question.\n"
+        "Output exactly one legal move in UCI format and nothing else.\n"
+        "Do not include analysis, commentary, or <think> blocks.\n"
         "Do not mention, quote, or allude to hints, feedback, reference solutions, Stockfish, "
         "engines, or external tools.\n"
     )
@@ -191,7 +196,7 @@ class Config:
     reprompt_truncation: Literal["left", "right", "error"] = "right"
     strict_single_turn: bool = True
     max_concurrent_teacher_logprobs: int = 64
-    student_max_thinking_tokens: int = 0
+    student_max_thinking_tokens: int = 2000
     grpo_mix_lambda: float = 0.0
     advantage_mode: Literal["token", "sequence"] = "token"
     updates_per_batch: int = 1
@@ -207,6 +212,19 @@ def _hash_to_unit_interval(text: str) -> float:
     digest = hashlib.sha256(text.encode("utf-8")).digest()
     value = int.from_bytes(digest[:8], byteorder="big", signed=False)
     return value / float(2**64)
+
+
+def _answer_text_after_think_blocks(response_text: str) -> str:
+    if not response_text:
+        return ""
+    last_close: re.Match[str] | None = None
+    for match in _THINK_CLOSE_RE.finditer(response_text):
+        last_close = match
+    if last_close is not None:
+        return response_text[last_close.end() :].strip()
+    if _THINK_OPEN_RE.search(response_text) is not None:
+        return ""
+    return response_text.strip()
 
 
 def _should_run_stockfish_verification(
@@ -1179,10 +1197,11 @@ async def build_group_sdpo_datums(
         try:
             if stockfish_hint_extractor is None or sample.fen is None:
                 return None
+            predicted_answer_text = _answer_text_after_think_blocks(sample.response_text)
             return await _stockfish_verify_predicted_move_async(
                 stockfish_client=stockfish_hint_extractor,
                 fen=sample.fen,
-                predicted_text=sample.response_text,
+                predicted_text=predicted_answer_text,
                 depth=config.stockfish_verification_depth,
                 multipv=config.stockfish_verification_multipv,
                 illegal_move_cp_loss=config.stockfish_illegal_move_cp_loss,
@@ -1199,10 +1218,11 @@ async def build_group_sdpo_datums(
         try:
             if stockfish_hint_extractor is None or sample.fen is None:
                 return "", None
+            predicted_answer_text = _answer_text_after_think_blocks(sample.response_text)
             return await _stockfish_analyze_and_verify_async(
                 stockfish_client=stockfish_hint_extractor,
                 fen=sample.fen,
-                predicted_text=sample.response_text,
+                predicted_text=predicted_answer_text,
                 hint_depth=config.stockfish_depth,
                 hint_multipv=config.stockfish_multipv,
                 verification_depth=config.stockfish_verification_depth,
@@ -2173,6 +2193,7 @@ async def main(config: Config):
                     ml_logger.log_long_text(
                         key=f"sdpo/debug_examples/batch_{i_batch:06d}",
                         text=long_text,
+                        step=i_batch,
                     )
 
             if config.save_every > 0 and (i_batch + 1) % config.save_every == 0:

@@ -30,7 +30,11 @@ except ImportError:  # pragma: no cover - guarded at runtime
 
 _UCI_RE = re.compile(r"\b([a-h][1-8][a-h][1-8][qrbn]?)\b", flags=re.IGNORECASE)
 _UCI_FULL_RE = re.compile(r"^[a-h][1-8][a-h][1-8][qrbn]?$", flags=re.IGNORECASE)
+_THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>(.*?)</think>", flags=re.IGNORECASE | re.DOTALL)
+_THINK_OPEN_RE = re.compile(r"<think\b", flags=re.IGNORECASE)
+_THINK_CLOSE_RE = re.compile(r"</think\s*>", flags=re.IGNORECASE)
 _GAME_VERIFICATION_CACHE_KEY = "_hf_chess_mix_stockfish_verification"
+_RESPONSE_STYLE_CACHE_KEY = "_hf_chess_mix_response_style"
 logger = logging.getLogger(__name__)
 
 
@@ -220,6 +224,36 @@ def _metadata_value(value: Any) -> Any:
     return str(value)
 
 
+def _format_content_as_string(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, Mapping):
+        for key in ("content", "text", "value", "answer"):
+            value = content.get(key)
+            if isinstance(value, str):
+                return value
+        return str(content)
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+                continue
+            if isinstance(item, Mapping):
+                for key in ("text", "content", "value"):
+                    value = item.get(key)
+                    if isinstance(value, str):
+                        parts.append(value)
+                        break
+                continue
+            if item is not None:
+                parts.append(str(item))
+        return "\n".join(part for part in parts if part)
+    return str(content)
+
+
 def _extract_first_uci(value: Any) -> str | None:
     if isinstance(value, str):
         match = _UCI_RE.search(value.lower())
@@ -268,7 +302,9 @@ def _make_prompt_from_fen(fen: str) -> list[dict[str, str]]:
             "content": (
                 "You are analyzing a chess position.\n"
                 "Choose the strongest next move for the side to move.\n"
-                "Return only one legal move in UCI format (for example, e2e4 or e7e8q).\n\n"
+                "Output format is strict: return exactly one legal move in UCI format "
+                "(for example, e2e4 or e7e8q), and nothing else.\n"
+                "Do not include analysis, explanations, comments, punctuation, or <think> blocks.\n\n"
                 f"FEN: {fen}\n"
                 f"Side to move: {side_to_move}"
             ),
@@ -826,6 +862,103 @@ def _normalize_uci(text: str) -> str:
     return match.group(1) if match else cleaned
 
 
+def _completion_to_text(completion: vf.Messages) -> str:
+    if isinstance(completion, str):
+        return completion
+    if isinstance(completion, Mapping):
+        return _format_content_as_string(completion.get("content", ""))
+    if isinstance(completion, list):
+        parts: list[str] = []
+        for message in completion:
+            if isinstance(message, Mapping):
+                role = str(message.get("role", "")).strip().lower()
+                if role and role != "assistant":
+                    continue
+                text = _format_content_as_string(message.get("content", ""))
+                if text:
+                    parts.append(text)
+            elif isinstance(message, str) and message:
+                parts.append(message)
+        return "\n".join(parts)
+    return ""
+
+
+def _answer_text_after_think_blocks(response_text: str) -> str:
+    if not response_text:
+        return ""
+    last_close: re.Match[str] | None = None
+    for match in _THINK_CLOSE_RE.finditer(response_text):
+        last_close = match
+    if last_close is not None:
+        return response_text[last_close.end() :].strip()
+    if _THINK_OPEN_RE.search(response_text) is not None:
+        return ""
+    return response_text.strip()
+
+
+def _parse_answer_after_think(parser: vf.Parser, completion: vf.Messages) -> str:
+    completion_text = _completion_to_text(completion)
+    post_think_text = _answer_text_after_think_blocks(completion_text)
+    if not post_think_text:
+        return ""
+    try:
+        parsed = parser.parse_answer([{"role": "assistant", "content": post_think_text}])
+    except Exception:
+        parsed = None
+    if isinstance(parsed, str) and parsed.strip():
+        return parsed.strip()
+    return post_think_text
+
+
+def _evaluate_response_style(
+    response_text: str,
+    *,
+    non_uci_penalty: float,
+    multi_uci_penalty: float,
+    think_token_penalty: float,
+    excess_chars_soft_limit: int,
+    excess_chars_penalty_per_100: float,
+) -> dict[str, float]:
+    stripped = response_text.strip()
+    if not stripped:
+        return {
+            "quality": 0.0,
+            "strict_uci": 0.0,
+            "think_tokens": 0.0,
+            "response_chars": 0.0,
+            "uci_count": 0.0,
+        }
+
+    lower = stripped.lower()
+    strict_uci = _UCI_FULL_RE.fullmatch(lower) is not None
+    uci_count = len(_UCI_RE.findall(lower))
+    think_tokens = 0
+    for block in _THINK_BLOCK_RE.findall(stripped):
+        think_tokens += len([token for token in re.findall(r"\S+", block) if token])
+
+    quality = 1.0
+    if not strict_uci:
+        quality *= max(0.0, 1.0 - max(0.0, float(non_uci_penalty)))
+    if uci_count != 1:
+        quality *= max(0.0, 1.0 - max(0.0, float(multi_uci_penalty)))
+    if think_tokens > 0 and think_token_penalty > 0.0:
+        quality *= math.exp(-max(0.0, float(think_token_penalty)) * float(think_tokens))
+    if excess_chars_soft_limit > 0 and len(stripped) > excess_chars_soft_limit:
+        excess_chars = len(stripped) - excess_chars_soft_limit
+        if excess_chars_penalty_per_100 > 0.0:
+            quality *= math.exp(
+                -max(0.0, float(excess_chars_penalty_per_100)) * (float(excess_chars) / 100.0)
+            )
+
+    return {
+        "quality": max(0.0, min(1.0, quality)),
+        "strict_uci": 1.0 if strict_uci else 0.0,
+        "think_tokens": float(think_tokens),
+        "response_chars": float(len(stripped)),
+        "uci_count": float(uci_count),
+    }
+
+
 def _game_quality_from_verification(
     verification: MoveVerification,
     expected_score_temperature: float,
@@ -933,6 +1066,12 @@ class ChessMoveRubric(vf.Rubric):
         game_reward_confidence_neutral: float,
         game_reward_confidence_nodes_reference: int,
         game_reward_confidence_seldepth_factor: float,
+        response_format_reward_enabled: bool = True,
+        response_non_uci_penalty: float = 0.25,
+        response_multi_uci_penalty: float = 0.15,
+        response_think_token_penalty: float = 0.0005,
+        response_excess_chars_soft_limit: int = 16,
+        response_excess_chars_penalty_per_100: float = 0.35,
     ):
         super().__init__()
         self.game_stockfish_pool = game_stockfish_pool
@@ -952,6 +1091,12 @@ class ChessMoveRubric(vf.Rubric):
         self.game_reward_confidence_seldepth_factor = float(
             game_reward_confidence_seldepth_factor
         )
+        self.response_format_reward_enabled = bool(response_format_reward_enabled)
+        self.response_non_uci_penalty = float(response_non_uci_penalty)
+        self.response_multi_uci_penalty = float(response_multi_uci_penalty)
+        self.response_think_token_penalty = float(response_think_token_penalty)
+        self.response_excess_chars_soft_limit = int(response_excess_chars_soft_limit)
+        self.response_excess_chars_penalty_per_100 = float(response_excess_chars_penalty_per_100)
 
         self.add_reward_func(self.chess_move_reward)
         self.add_metric(self.game_move_legal_metric)
@@ -962,6 +1107,10 @@ class ChessMoveRubric(vf.Rubric):
         self.add_metric(self.game_syzygy_wdl_penalty_metric)
         self.add_metric(self.game_syzygy_dtz_penalty_metric)
         self.add_metric(self.game_search_confidence_metric)
+        self.add_metric(self.response_format_quality_metric)
+        self.add_metric(self.response_strict_uci_metric)
+        self.add_metric(self.response_think_tokens_metric)
+        self.add_metric(self.response_chars_metric)
 
     @staticmethod
     def _source(info: Mapping[str, Any]) -> str:
@@ -970,6 +1119,46 @@ class ChessMoveRubric(vf.Rubric):
     @staticmethod
     def _is_game_source(info: Mapping[str, Any]) -> bool:
         return ChessMoveRubric._source(info) == "lichess_game"
+
+    def _response_style(
+        self,
+        *,
+        completion: vf.Messages,
+        state: vf.State,
+    ) -> dict[str, float]:
+        cached = state.get(_RESPONSE_STYLE_CACHE_KEY)
+        if isinstance(cached, dict):
+            quality = cached.get("quality")
+            if isinstance(quality, (int, float)):
+                return {
+                    "quality": float(cached.get("quality", 0.0)),
+                    "strict_uci": float(cached.get("strict_uci", 0.0)),
+                    "think_tokens": float(cached.get("think_tokens", 0.0)),
+                    "response_chars": float(cached.get("response_chars", 0.0)),
+                    "uci_count": float(cached.get("uci_count", 0.0)),
+                }
+
+        if not self.response_format_reward_enabled:
+            result = {
+                "quality": 1.0,
+                "strict_uci": 1.0,
+                "think_tokens": 0.0,
+                "response_chars": float(len(_completion_to_text(completion).strip())),
+                "uci_count": 1.0,
+            }
+            state[_RESPONSE_STYLE_CACHE_KEY] = result
+            return result
+
+        result = _evaluate_response_style(
+            _completion_to_text(completion),
+            non_uci_penalty=self.response_non_uci_penalty,
+            multi_uci_penalty=self.response_multi_uci_penalty,
+            think_token_penalty=self.response_think_token_penalty,
+            excess_chars_soft_limit=self.response_excess_chars_soft_limit,
+            excess_chars_penalty_per_100=self.response_excess_chars_penalty_per_100,
+        )
+        state[_RESPONSE_STYLE_CACHE_KEY] = result
+        return result
 
     async def _get_game_verification(
         self,
@@ -988,7 +1177,7 @@ class ChessMoveRubric(vf.Rubric):
         fen = _as_stripped(info.get("fen"))
         if fen is None:
             return None
-        predicted_text = parser.parse_answer(completion) or ""
+        predicted_text = _parse_answer_after_think(parser, completion)
         verification = await self.game_stockfish_pool.verify_predicted_move_async(
             fen=fen,
             predicted_text=predicted_text,
@@ -1007,10 +1196,13 @@ class ChessMoveRubric(vf.Rubric):
         state: vf.State,
         **kwargs: Any,
     ) -> float:
-        predicted = _normalize_uci(parser.parse_answer(completion) or "")
+        style = self._response_style(completion=completion, state=state)
+        format_quality = style["quality"]
+        predicted = _normalize_uci(_parse_answer_after_think(parser, completion))
         expected = _normalize_uci(answer)
         if not self._is_game_source(info):
-            return 1.0 if predicted == expected else 0.0
+            base_reward = 1.0 if predicted == expected else 0.0
+            return max(0.0, min(1.0, base_reward * format_quality))
 
         verification = await self._get_game_verification(
             parser=parser,
@@ -1019,7 +1211,8 @@ class ChessMoveRubric(vf.Rubric):
             state=state,
         )
         if verification is None:
-            return 1.0 if predicted == expected else 0.0
+            base_reward = 1.0 if predicted == expected else 0.0
+            return max(0.0, min(1.0, base_reward * format_quality))
         if not verification.move_is_legal:
             return 0.0
 
@@ -1057,6 +1250,7 @@ class ChessMoveRubric(vf.Rubric):
             and verification.predicted_move_uci == verification.best_move_uci
         ):
             reward += self.game_reward_best_move_bonus
+        reward *= format_quality
         return max(0.0, min(1.0, reward))
 
     async def game_move_legal_metric(
@@ -1224,6 +1418,54 @@ class ChessMoveRubric(vf.Rubric):
             seldepth_factor=self.game_reward_confidence_seldepth_factor,
         )
 
+    async def response_format_quality_metric(
+        self,
+        parser: vf.Parser,
+        completion: vf.Messages,
+        info: Mapping[str, Any],
+        state: vf.State,
+        **kwargs: Any,
+    ) -> float:
+        _ = parser, info, kwargs
+        style = self._response_style(completion=completion, state=state)
+        return style["quality"]
+
+    async def response_strict_uci_metric(
+        self,
+        parser: vf.Parser,
+        completion: vf.Messages,
+        info: Mapping[str, Any],
+        state: vf.State,
+        **kwargs: Any,
+    ) -> float:
+        _ = parser, info, kwargs
+        style = self._response_style(completion=completion, state=state)
+        return style["strict_uci"]
+
+    async def response_think_tokens_metric(
+        self,
+        parser: vf.Parser,
+        completion: vf.Messages,
+        info: Mapping[str, Any],
+        state: vf.State,
+        **kwargs: Any,
+    ) -> float:
+        _ = parser, info, kwargs
+        style = self._response_style(completion=completion, state=state)
+        return style["think_tokens"]
+
+    async def response_chars_metric(
+        self,
+        parser: vf.Parser,
+        completion: vf.Messages,
+        info: Mapping[str, Any],
+        state: vf.State,
+        **kwargs: Any,
+    ) -> float:
+        _ = parser, info, kwargs
+        style = self._response_style(completion=completion, state=state)
+        return style["response_chars"]
+
 
 class HFChessMixEnv(vf.SingleTurnEnv):
     def __init__(
@@ -1286,6 +1528,12 @@ def load_environment(
     game_reward_confidence_nodes_reference: int = 500000,
     game_reward_confidence_seldepth_factor: float = 1.5,
     game_reward_illegal_move_cp_loss: float = 1000.0,
+    response_format_reward_enabled: bool = True,
+    response_non_uci_penalty: float = 0.25,
+    response_multi_uci_penalty: float = 0.15,
+    response_think_token_penalty: float = 0.0005,
+    response_excess_chars_soft_limit: int = 16,
+    response_excess_chars_penalty_per_100: float = 0.35,
     **kwargs: Any,
 ) -> vf.Environment:
     if chess is None:
@@ -1391,6 +1639,27 @@ def load_environment(
             "game_reward_illegal_move_cp_loss must be >= 0, "
             f"got {game_reward_illegal_move_cp_loss}"
         )
+    if response_non_uci_penalty < 0.0:
+        raise ValueError(f"response_non_uci_penalty must be >= 0, got {response_non_uci_penalty}")
+    if response_multi_uci_penalty < 0.0:
+        raise ValueError(
+            f"response_multi_uci_penalty must be >= 0, got {response_multi_uci_penalty}"
+        )
+    if response_think_token_penalty < 0.0:
+        raise ValueError(
+            "response_think_token_penalty must be >= 0, "
+            f"got {response_think_token_penalty}"
+        )
+    if response_excess_chars_soft_limit < 0:
+        raise ValueError(
+            "response_excess_chars_soft_limit must be >= 0, "
+            f"got {response_excess_chars_soft_limit}"
+        )
+    if response_excess_chars_penalty_per_100 < 0.0:
+        raise ValueError(
+            "response_excess_chars_penalty_per_100 must be >= 0, "
+            f"got {response_excess_chars_penalty_per_100}"
+        )
 
     stockfish_config = _build_stockfish_config(
         stockfish_path=stockfish_path,
@@ -1464,6 +1733,12 @@ def load_environment(
         game_reward_confidence_neutral=game_reward_confidence_neutral,
         game_reward_confidence_nodes_reference=game_reward_confidence_nodes_reference,
         game_reward_confidence_seldepth_factor=game_reward_confidence_seldepth_factor,
+        response_format_reward_enabled=response_format_reward_enabled,
+        response_non_uci_penalty=response_non_uci_penalty,
+        response_multi_uci_penalty=response_multi_uci_penalty,
+        response_think_token_penalty=response_think_token_penalty,
+        response_excess_chars_soft_limit=response_excess_chars_soft_limit,
+        response_excess_chars_penalty_per_100=response_excess_chars_penalty_per_100,
     )
     logger.info("hf-chess-mix: load_environment complete")
     return HFChessMixEnv(
@@ -1515,6 +1790,12 @@ def load_environment(
             "game_reward_confidence_nodes_reference": game_reward_confidence_nodes_reference,
             "game_reward_confidence_seldepth_factor": game_reward_confidence_seldepth_factor,
             "game_reward_illegal_move_cp_loss": game_reward_illegal_move_cp_loss,
+            "response_format_reward_enabled": response_format_reward_enabled,
+            "response_non_uci_penalty": response_non_uci_penalty,
+            "response_multi_uci_penalty": response_multi_uci_penalty,
+            "response_think_token_penalty": response_think_token_penalty,
+            "response_excess_chars_soft_limit": response_excess_chars_soft_limit,
+            "response_excess_chars_penalty_per_100": response_excess_chars_penalty_per_100,
         },
         **kwargs,
     )

@@ -11,6 +11,7 @@ import torch
 
 from tinker_cookbook.recipes.verifiers_rl.tinker_openai import (
     _parse_max_thinking_tokens,
+    _truncate_and_close_thinking_blocks_text,
     _truncate_thinking_blocks_text,
 )
 from tinker_cookbook.sdpo import train as sdpo_train
@@ -343,6 +344,29 @@ def test_truncate_thinking_blocks_text():
     assert changed is False
     assert unchanged == text
 
+
+def test_truncate_and_close_thinking_blocks_text_closes_unterminated_think():
+    tokenizer = _CharTokenizer()
+    text = "Before <think>abcdefghij"
+    bounded, changed = _truncate_and_close_thinking_blocks_text(
+        text=text,
+        tokenizer=tokenizer,
+        max_thinking_tokens=4,
+    )
+    assert changed is True
+    assert bounded == "Before <think>abcd</think>"
+
+
+def test_truncate_and_close_thinking_blocks_text_keeps_closed_blocks():
+    tokenizer = _CharTokenizer()
+    text = "Before <think>abcdefghij</think> After"
+    bounded, changed = _truncate_and_close_thinking_blocks_text(
+        text=text,
+        tokenizer=tokenizer,
+        max_thinking_tokens=4,
+    )
+    assert changed is True
+    assert bounded == "Before <think>abcd</think> After"
 
 def test_build_sdpo_datum_alignment():
     prompt_tokens = [1, 2, 3]

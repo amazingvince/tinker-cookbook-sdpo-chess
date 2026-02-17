@@ -67,7 +67,9 @@ class CLIConfig:
     reprompt_template: str = (
         "{prompt}{solution}{feedback}{hints}\n"
         "Use the additional context above only as private guidance.\n"
-        "Now answer the original question in your own style.\n"
+        "Now answer the original question.\n"
+        "Output exactly one legal move in UCI format and nothing else.\n"
+        "Do not include analysis, commentary, or <think> blocks.\n"
         "Do not mention, quote, or allude to hints, feedback, reference solutions, Stockfish, "
         "engines, or external tools.\n"
     )
@@ -124,7 +126,7 @@ class CLIConfig:
     reprompt_truncation: Literal["left", "right", "error"] = "right"
     strict_single_turn: bool = True
     max_concurrent_teacher_logprobs: int = 64
-    student_max_thinking_tokens: int = 0
+    student_max_thinking_tokens: int = 2000
     grpo_mix_lambda: float = 0.0
     advantage_mode: Literal["token", "sequence"] = "token"
     updates_per_batch: int = 1

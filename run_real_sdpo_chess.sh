@@ -74,10 +74,11 @@ fi
 : "${MAX_CONCURRENT_TEACHER_LOGPROBS:=64}"
 : "${MAX_CONCURRENT_GENERATION:=32}"
 : "${MAX_CONCURRENT_SCORING:=32}"
-: "${STUDENT_MAX_THINKING_TOKENS:=256}"
+: "${STUDENT_MAX_THINKING_TOKENS:=2000}"
 : "${DEBUG_EXAMPLES_EVERY_N_STEPS:=10}"
 : "${DEBUG_EXAMPLES_PER_STEP:=2}"
 : "${DEBUG_EXAMPLES_MAX_TEXT_CHARS:=4000}"
+: "${DEBUG_EXAMPLES_FILE_NAME:=sdpo_debug_examples.jsonl}"
 : "${PUZZLES_FRACTION:=0.5}"
 : "${PUZZLE_SOLVER_MOVES_ONLY:=true}"
 : "${MAX_PUZZLE_SOLVER_MOVES_PER_PUZZLE:=-1}"
@@ -91,6 +92,12 @@ fi
 : "${SHUFFLE_BUFFER_SIZE:=10000}"
 : "${GAME_ANSWER_MODE:=stockfish}"
 : "${USE_STOCKFISH_GAME_REWARD:=true}"
+: "${RESPONSE_FORMAT_REWARD_ENABLED:=true}"
+: "${RESPONSE_NON_UCI_PENALTY:=0.25}"
+: "${RESPONSE_MULTI_UCI_PENALTY:=0.15}"
+: "${RESPONSE_THINK_TOKEN_PENALTY:=0.0005}"
+: "${RESPONSE_EXCESS_CHARS_SOFT_LIMIT:=16}"
+: "${RESPONSE_EXCESS_CHARS_PENALTY_PER_100:=0.35}"
 : "${WANDB_PROJECT:=sdpo-chess}"
 : "${WANDB_NAME_PREFIX:=sdpo-chess-real}"
 : "${LOG_ROOT:=$SCRIPT_DIR/runs/sdpo_chess}"
@@ -205,6 +212,12 @@ export OVERSAMPLE_FACTOR
 export SHUFFLE_BUFFER_SIZE
 export GAME_ANSWER_MODE
 export USE_STOCKFISH_GAME_REWARD
+export RESPONSE_FORMAT_REWARD_ENABLED
+export RESPONSE_NON_UCI_PENALTY
+export RESPONSE_MULTI_UCI_PENALTY
+export RESPONSE_THINK_TOKEN_PENALTY
+export RESPONSE_EXCESS_CHARS_SOFT_LIMIT
+export RESPONSE_EXCESS_CHARS_PENALTY_PER_100
 export STOCKFISH_PATH
 export GAME_STOCKFISH_DEPTH
 export GAME_STOCKFISH_MULTIPV
@@ -248,6 +261,12 @@ cfg = {
     "shuffle_buffer_size": env_int("SHUFFLE_BUFFER_SIZE"),
     "game_answer_mode": os.environ["GAME_ANSWER_MODE"],
     "use_stockfish_game_reward": env_bool("USE_STOCKFISH_GAME_REWARD"),
+    "response_format_reward_enabled": env_bool("RESPONSE_FORMAT_REWARD_ENABLED"),
+    "response_non_uci_penalty": env_float("RESPONSE_NON_UCI_PENALTY"),
+    "response_multi_uci_penalty": env_float("RESPONSE_MULTI_UCI_PENALTY"),
+    "response_think_token_penalty": env_float("RESPONSE_THINK_TOKEN_PENALTY"),
+    "response_excess_chars_soft_limit": env_int("RESPONSE_EXCESS_CHARS_SOFT_LIMIT"),
+    "response_excess_chars_penalty_per_100": env_float("RESPONSE_EXCESS_CHARS_PENALTY_PER_100"),
     "stockfish_path": os.environ["STOCKFISH_PATH"],
     "stockfish_depth": env_int("GAME_STOCKFISH_DEPTH"),
     "stockfish_multipv": env_int("GAME_STOCKFISH_MULTIPV"),
@@ -272,6 +291,9 @@ echo "model_name=${MODEL_NAME}"
 echo "buffer_size=${BUFFER_SIZE} source_pool=${MAX_EXAMPLES} num_batches=${DATASET_NUM_BATCHES}"
 echo "stockfish_path=${STOCKFISH_PATH}"
 echo "stockfish_num_workers=${SF_NUM_WORKERS} stockfish_threads=${SF_THREADS} stockfish_hash_mb=${SF_HASH_MB}"
+echo "student_max_thinking_tokens=${STUDENT_MAX_THINKING_TOKENS}"
+echo "debug_examples_every_n_steps=${DEBUG_EXAMPLES_EVERY_N_STEPS} debug_examples_per_step=${DEBUG_EXAMPLES_PER_STEP}"
+echo "debug_examples_file_name=${DEBUG_EXAMPLES_FILE_NAME}"
 if [[ -n "$SYZYGY_DIR" ]]; then
   echo "syzygy_path=${SYZYGY_DIR}"
 else
@@ -339,6 +361,7 @@ train_cmd=(
   "debug_examples_every_n_steps=${DEBUG_EXAMPLES_EVERY_N_STEPS}"
   "debug_examples_per_step=${DEBUG_EXAMPLES_PER_STEP}"
   "debug_examples_max_text_chars=${DEBUG_EXAMPLES_MAX_TEXT_CHARS}"
+  "debug_examples_file_name=${DEBUG_EXAMPLES_FILE_NAME}"
 )
 
 if [[ -n "${BASE_URL:-}" ]]; then

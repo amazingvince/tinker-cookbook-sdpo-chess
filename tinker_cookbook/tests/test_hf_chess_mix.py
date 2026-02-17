@@ -15,6 +15,7 @@ from tinker_cookbook.sdpo.chess_hints import MoveVerification  # noqa: E402
 from tinker_cookbook.recipes.verifiers_rl.hf_chess_mix import (  # noqa: E402
     ChessMoveRubric,
     _assemble_mixed_examples,
+    _evaluate_response_style,
     _extract_first_uci,
     _game_quality_from_verification,
     _label_selected_game_rows_with_best_moves,
@@ -137,6 +138,31 @@ def test_game_quality_from_verification_cp_fallback_and_illegal():
         )
         == 0.0
     )
+
+
+def test_evaluate_response_style_penalizes_non_strict_and_thinking():
+    strict = _evaluate_response_style(
+        "e2e4",
+        non_uci_penalty=0.25,
+        multi_uci_penalty=0.15,
+        think_token_penalty=0.0005,
+        excess_chars_soft_limit=16,
+        excess_chars_penalty_per_100=0.35,
+    )
+    chatty = _evaluate_response_style(
+        "<think>considering candidate lines before choosing a move</think>\nI would play e2e4.",
+        non_uci_penalty=0.25,
+        multi_uci_penalty=0.15,
+        think_token_penalty=0.0005,
+        excess_chars_soft_limit=16,
+        excess_chars_penalty_per_100=0.35,
+    )
+    assert strict["strict_uci"] == 1.0
+    assert strict["think_tokens"] == 0.0
+    assert strict["quality"] == pytest.approx(1.0, rel=1e-6)
+    assert chatty["strict_uci"] == 0.0
+    assert chatty["think_tokens"] > 0.0
+    assert chatty["quality"] < strict["quality"]
 
 
 class _FakeVerifierPool:
@@ -264,6 +290,115 @@ def test_chess_move_rubric_puzzle_reward_remains_exact_match():
         )
     )
     assert reward == 1.0
+
+
+def test_chess_move_rubric_penalizes_chatty_puzzle_response():
+    rubric = ChessMoveRubric(
+        game_stockfish_pool=None,
+        game_stockfish_depth=20,
+        game_reward_illegal_move_cp_loss=1000.0,
+        game_reward_legal_floor=0.2,
+        game_reward_best_move_bonus=0.05,
+        game_reward_expected_score_temperature=0.08,
+        game_reward_cp_loss_scale=120.0,
+        game_reward_syzygy_wdl_scale=1.0,
+        game_reward_syzygy_dtz_scale=20.0,
+        game_reward_pv_overlap_bonus=0.05,
+        game_reward_pv_motif_plies=6,
+        game_reward_use_confidence_weighting=True,
+        game_reward_confidence_neutral=0.5,
+        game_reward_confidence_nodes_reference=500000,
+        game_reward_confidence_seldepth_factor=1.5,
+    )
+    parser = vf.Parser()
+    completion = [{"role": "assistant", "content": "e2e4 because it controls the center."}]
+    info = {"source": "lichess_puzzle", "fen": chess.STARTING_FEN}
+    state = {"task": "chess_next_move", "trajectory": []}
+    reward = asyncio.run(
+        rubric.chess_move_reward(
+            parser=parser,
+            completion=completion,
+            answer="e2e4",
+            info=info,
+            state=state,
+        )
+    )
+    assert 0.0 < reward < 1.0
+    strict_metric = asyncio.run(
+        rubric.response_strict_uci_metric(
+            parser=parser,
+            completion=completion,
+            info=info,
+            state=state,
+        )
+    )
+    assert strict_metric == 0.0
+
+
+def test_chess_move_rubric_parses_answer_only_after_closing_think_tag():
+    rubric = ChessMoveRubric(
+        game_stockfish_pool=None,
+        game_stockfish_depth=20,
+        game_reward_illegal_move_cp_loss=1000.0,
+        game_reward_legal_floor=0.2,
+        game_reward_best_move_bonus=0.05,
+        game_reward_expected_score_temperature=0.08,
+        game_reward_cp_loss_scale=120.0,
+        game_reward_syzygy_wdl_scale=1.0,
+        game_reward_syzygy_dtz_scale=20.0,
+        game_reward_pv_overlap_bonus=0.05,
+        game_reward_pv_motif_plies=6,
+        game_reward_use_confidence_weighting=True,
+        game_reward_confidence_neutral=0.5,
+        game_reward_confidence_nodes_reference=500000,
+        game_reward_confidence_seldepth_factor=1.5,
+    )
+    parser = vf.Parser()
+    info = {"source": "lichess_puzzle", "fen": chess.STARTING_FEN}
+    state = {"task": "chess_next_move", "trajectory": []}
+
+    completion_answer_after_think = [
+        {"role": "assistant", "content": "<think>I considered e2e3 first.</think>\ne2e4"}
+    ]
+    reward_after = asyncio.run(
+        rubric.chess_move_reward(
+            parser=parser,
+            completion=completion_answer_after_think,
+            answer="e2e4",
+            info=info,
+            state=state,
+        )
+    )
+    assert 0.0 < reward_after < 1.0
+
+    completion_answer_only_inside_think = [
+        {"role": "assistant", "content": "<think>best move is e2e4</think>"}
+    ]
+    reward_inside_only = asyncio.run(
+        rubric.chess_move_reward(
+            parser=parser,
+            completion=completion_answer_only_inside_think,
+            answer="e2e4",
+            info=info,
+            state={"task": "chess_next_move", "trajectory": []},
+        )
+    )
+    assert reward_inside_only == 0.0
+
+    completion_unclosed_think = [
+        {"role": "assistant", "content": "<think>best move is e2e4"}
+    ]
+    reward_unclosed = asyncio.run(
+        rubric.chess_move_reward(
+            parser=parser,
+            completion=completion_unclosed_think,
+            answer="e2e4",
+            info=info,
+            state={"task": "chess_next_move", "trajectory": []},
+        )
+    )
+    assert reward_unclosed == 0.0
+    assert reward_after > reward_inside_only
 
 
 def test_syzygy_penalties_and_pv_overlap_helpers():
