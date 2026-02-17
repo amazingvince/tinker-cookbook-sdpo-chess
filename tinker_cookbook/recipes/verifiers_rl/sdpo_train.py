@@ -35,7 +35,7 @@ class CLIConfig:
     groups_per_batch: int = 32
     num_substeps: int = 1
     learning_rate: float = 1e-5
-    max_tokens: int = 512
+    max_tokens: int = 2304
     temperature: float = 1.0
     max_concurrent_generation: int = -1
     max_concurrent_scoring: int = -1
@@ -127,6 +127,7 @@ class CLIConfig:
     strict_single_turn: bool = True
     max_concurrent_teacher_logprobs: int = 64
     student_max_thinking_tokens: int = 2000
+    student_forced_answer_tokens: int = 32
     grpo_mix_lambda: float = 0.0
     advantage_mode: Literal["token", "sequence"] = "token"
     updates_per_batch: int = 1
@@ -250,6 +251,7 @@ async def cli_main(cli_config: CLIConfig, env: Any | None):
         strict_single_turn=cli_config.strict_single_turn,
         max_concurrent_teacher_logprobs=cli_config.max_concurrent_teacher_logprobs,
         student_max_thinking_tokens=cli_config.student_max_thinking_tokens,
+        student_forced_answer_tokens=cli_config.student_forced_answer_tokens,
         grpo_mix_lambda=cli_config.grpo_mix_lambda,
         advantage_mode=cli_config.advantage_mode,
         updates_per_batch=cli_config.updates_per_batch,

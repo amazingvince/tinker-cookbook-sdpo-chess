@@ -112,6 +112,19 @@ def _truncate_and_close_thinking_blocks_text(
     return closed_text, True
 
 
+def _answer_text_after_think_blocks(response_text: str) -> str:
+    if not response_text:
+        return ""
+    last_close: re.Match[str] | None = None
+    for match in re.finditer(r"</think\s*>", response_text, flags=re.IGNORECASE):
+        last_close = match
+    if last_close is not None:
+        return response_text[last_close.end() :].strip()
+    if re.search(r"<think\b", response_text, flags=re.IGNORECASE) is not None:
+        return ""
+    return response_text.strip()
+
+
 class TinkerAsyncOpenAIClient(AsyncOpenAI):
     """
     OpenAI-compatible async client that routes calls to a Tinker SamplingClient.
@@ -166,19 +179,47 @@ class TinkerChatCompletions(OpenAIAsyncChatCompletions):
             raise ValueError("stream=True not supported by TinkerAsyncOpenAIClient")
         sampling_args = {k: v for k, v in kwargs.items() if k not in ("model", "messages", "tools")}
         max_thinking_tokens = _parse_max_thinking_tokens(sampling_args.get("max_thinking_tokens"))
+        force_answer_max_tokens = _parse_max_thinking_tokens(
+            sampling_args.get("force_answer_max_tokens", 32 if max_thinking_tokens > 0 else 0)
+        )
+        force_answer_temperature_raw = sampling_args.get("force_answer_temperature", 0.2)
+        try:
+            force_answer_temperature = float(force_answer_temperature_raw)
+        except (TypeError, ValueError):
+            force_answer_temperature = 0.2
 
         stop = sampling_args.get("stop", self._parent.renderer.get_stop_sequences())
         max_tokens = sampling_args.get("max_tokens") or sampling_args.get("max_completion_tokens")
+        max_tokens_int = int(max_tokens or 128)
+        reserved_answer_tokens = 0
+        initial_max_tokens = max_tokens_int
+        if max_thinking_tokens > 0 and force_answer_max_tokens > 0 and max_tokens_int > 1:
+            reserved_answer_tokens = min(force_answer_max_tokens, max_tokens_int - 1)
+            initial_max_tokens = max_tokens_int - reserved_answer_tokens
 
         model_input = self._parent.renderer.build_generation_prompt(messages)
         prompt_token_ids: List[int] = model_input.to_ints()
+
+        async def _recompute_completion_logprobs(
+            completion_ids: list[int],
+        ) -> list[float] | None:
+            full_input = tinker.ModelInput.from_ints(prompt_token_ids + completion_ids)
+            full_logprobs = await self._parent.sampling_client.compute_logprobs_async(full_input)
+            completion_logprobs = full_logprobs[
+                len(prompt_token_ids) : len(prompt_token_ids) + len(completion_ids)
+            ]
+            if len(completion_logprobs) != len(completion_ids):
+                return None
+            if any(lp is None for lp in completion_logprobs):
+                return None
+            return [float(lp) for lp in completion_logprobs if lp is not None]
 
         sample = await self._parent.sampling_client.sample_async(
             prompt=model_input,
             num_samples=1,
             sampling_params=tinker.SamplingParams(
                 temperature=float(sampling_args.get("temperature", 1.0)),
-                max_tokens=int(max_tokens or 128),
+                max_tokens=initial_max_tokens,
                 top_p=float(sampling_args.get("top_p", 1.0)),
                 top_k=int(sampling_args.get("top_k", -1)),
                 stop=stop,
@@ -202,19 +243,42 @@ class TinkerChatCompletions(OpenAIAsyncChatCompletions):
                     bounded_text, add_special_tokens=False
                 )
                 try:
-                    full_input = tinker.ModelInput.from_ints(prompt_token_ids + bounded_token_ids)
-                    full_logprobs = await self._parent.sampling_client.compute_logprobs_async(full_input)
-                    bounded_logprobs = full_logprobs[
-                        len(prompt_token_ids) : len(prompt_token_ids) + len(bounded_token_ids)
-                    ]
-                    if len(bounded_logprobs) == len(bounded_token_ids) and all(
-                        lp is not None for lp in bounded_logprobs
-                    ):
+                    bounded_logprobs = await _recompute_completion_logprobs(bounded_token_ids)
+                    if bounded_logprobs is not None:
                         completion_token_ids = bounded_token_ids
-                        logprobs = [float(lp) for lp in bounded_logprobs if lp is not None]
+                        logprobs = bounded_logprobs
                 except Exception:
                     # If recomputing logprobs fails, keep original sampled output untouched.
                     pass
+
+        if max_thinking_tokens > 0 and reserved_answer_tokens > 0 and completion_token_ids:
+            completion_text = self._parent.tokenizer.decode(
+                completion_token_ids, skip_special_tokens=False
+            )
+            post_think_answer = _answer_text_after_think_blocks(completion_text)
+            has_think_tag = _THINK_TAG_RE.search(completion_text) is not None
+            if has_think_tag and not post_think_answer:
+                continuation_input = tinker.ModelInput.from_ints(prompt_token_ids + completion_token_ids)
+                continuation_sample = await self._parent.sampling_client.sample_async(
+                    prompt=continuation_input,
+                    num_samples=1,
+                    sampling_params=tinker.SamplingParams(
+                        temperature=max(0.0, force_answer_temperature),
+                        max_tokens=reserved_answer_tokens,
+                        top_p=float(sampling_args.get("top_p", 1.0)),
+                        top_k=int(sampling_args.get("top_k", -1)),
+                        stop=stop,
+                    ),
+                )
+                continuation_tokens = continuation_sample.sequences[0].tokens
+                if continuation_tokens:
+                    completion_token_ids = list(completion_token_ids) + list(continuation_tokens)
+                    try:
+                        recomputed = await _recompute_completion_logprobs(completion_token_ids)
+                        if recomputed is not None:
+                            logprobs = recomputed
+                    except Exception:
+                        pass
 
         assistant_message, parse_success = self._parent.renderer.parse_response(
             completion_token_ids

@@ -135,6 +135,9 @@ Important:
 - They are related but not identical; use the presets below as practical parity settings.
 - `max_reprompt_tokens=0` disables truncation so long teacher hints are preserved.
 - `student_max_thinking_tokens` bounds `<think>...</think>` token count during rollout (`2000` default, `0` disables).
+- `student_forced_answer_tokens` reserves a short continuation pass so outputs that stay in thinking mode
+  still get a final answer attempt (`32` default).
+- Keep `max_tokens` above `student_max_thinking_tokens + student_forced_answer_tokens`.
 - For Stockfish efficiency, default shared mode is `stockfish_shared_hint_and_verification_eval=true` with
   `stockfish_shared_eval_mode=two_pass` (wide hints + deep scoring), and
   `stockfish_verification_multipv=1` for fast deep truth labels (raise only if you need broad deep candidates).
@@ -240,6 +243,7 @@ python -m tinker_cookbook.recipes.verifiers_rl.sdpo_train \
   environment_feedback_only_without_solution=true \
   remove_thinking_from_demonstration=true \
   student_max_thinking_tokens=2000 \
+  student_forced_answer_tokens=32 \
   max_reprompt_tokens=0 \
   reprompt_truncation=right \
   updates_per_batch=1 \
@@ -272,6 +276,7 @@ python -m tinker_cookbook.recipes.verifiers_rl.sdpo_train \
   environment_feedback_only_without_solution=true \
   remove_thinking_from_demonstration=true \
   student_max_thinking_tokens=2000 \
+  student_forced_answer_tokens=32 \
   max_reprompt_tokens=0 \
   reprompt_truncation=right \
   updates_per_batch=1 \
@@ -292,6 +297,7 @@ stockfish_multipv=5 \
 stockfish_verification_depth=20 \
 stockfish_verification_sample_rate=1.0 \
 student_max_thinking_tokens=2000 \
+student_forced_answer_tokens=32 \
 stockfish_analysis_time_limit_sec=0.2 \
 stockfish_engine_max_retries=1 \
 include_stockfish_move_feedback=true \

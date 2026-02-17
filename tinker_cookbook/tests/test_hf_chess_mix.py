@@ -162,7 +162,48 @@ def test_evaluate_response_style_penalizes_non_strict_and_thinking():
     assert strict["quality"] == pytest.approx(1.0, rel=1e-6)
     assert chatty["strict_uci"] == 0.0
     assert chatty["think_tokens"] > 0.0
+    assert chatty["post_think_answer_present"] == 1.0
+    assert chatty["unclosed_think"] == 0.0
     assert chatty["quality"] < strict["quality"]
+
+
+def test_evaluate_response_style_hard_penalizes_unclosed_or_no_post_think_answer():
+    unclosed = _evaluate_response_style(
+        "<think>candidate move e2e4",
+        non_uci_penalty=0.25,
+        multi_uci_penalty=0.15,
+        think_token_penalty=0.0005,
+        excess_chars_soft_limit=16,
+        excess_chars_penalty_per_100=0.35,
+    )
+    assert unclosed["quality"] == 0.0
+    assert unclosed["unclosed_think"] == 1.0
+    assert unclosed["post_think_answer_present"] == 0.0
+    assert unclosed["think_tokens"] > 0.0
+
+    closed_without_answer = _evaluate_response_style(
+        "<think>best move is e2e4</think>",
+        non_uci_penalty=0.25,
+        multi_uci_penalty=0.15,
+        think_token_penalty=0.0005,
+        excess_chars_soft_limit=16,
+        excess_chars_penalty_per_100=0.35,
+    )
+    assert closed_without_answer["quality"] == 0.0
+    assert closed_without_answer["unclosed_think"] == 0.0
+    assert closed_without_answer["post_think_answer_present"] == 0.0
+
+    closed_with_answer = _evaluate_response_style(
+        "<think>candidate lines</think>\ne2e4",
+        non_uci_penalty=0.25,
+        multi_uci_penalty=0.15,
+        think_token_penalty=0.0005,
+        excess_chars_soft_limit=16,
+        excess_chars_penalty_per_100=0.35,
+    )
+    assert closed_with_answer["strict_uci"] == 1.0
+    assert closed_with_answer["post_think_answer_present"] == 1.0
+    assert 0.0 < closed_with_answer["quality"] < 1.0
 
 
 class _FakeVerifierPool:

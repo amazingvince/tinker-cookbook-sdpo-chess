@@ -197,6 +197,7 @@ class Config:
     strict_single_turn: bool = True
     max_concurrent_teacher_logprobs: int = 64
     student_max_thinking_tokens: int = 2000
+    student_forced_answer_tokens: int = 32
     grpo_mix_lambda: float = 0.0
     advantage_mode: Literal["token", "sequence"] = "token"
     updates_per_batch: int = 1
@@ -1731,6 +1732,7 @@ async def run_sdpo_batch_update(
         "sdpo/full_logit_distillation": float(config.full_logit_distillation),
         "sdpo/updates_per_batch": float(config.updates_per_batch),
         "sdpo/student_max_thinking_tokens": float(config.student_max_thinking_tokens),
+        "sdpo/student_forced_answer_tokens": float(config.student_forced_answer_tokens),
         "sdpo/stockfish_hints_enabled": float(config.enable_stockfish_hints),
         "sdpo/stockfish_move_verification_enabled": float(config.enable_stockfish_move_verification),
         "sdpo/stockfish_verification_sample_rate": float(config.stockfish_verification_sample_rate),
@@ -1858,6 +1860,7 @@ async def _run_verifiers_group_rollout(
     group_size: int,
     max_tokens: int,
     student_max_thinking_tokens: int,
+    student_forced_answer_tokens: int,
     temperature: float,
     max_concurrent_generation: int,
     max_concurrent_scoring: int,
@@ -1889,6 +1892,8 @@ async def _run_verifiers_group_rollout(
     }
     if student_max_thinking_tokens > 0:
         gen_sampling_args["max_thinking_tokens"] = student_max_thinking_tokens
+        if student_forced_answer_tokens > 0:
+            gen_sampling_args["force_answer_max_tokens"] = student_forced_answer_tokens
 
     run_group_fn = builder.vf_env.run_group
     run_group_sig = inspect.signature(run_group_fn)
@@ -1985,6 +1990,30 @@ async def main(config: Config):
         raise ValueError(
             "student_max_thinking_tokens must be >= 0, got "
             f"{config.student_max_thinking_tokens}"
+        )
+    if config.student_forced_answer_tokens < 0:
+        raise ValueError(
+            "student_forced_answer_tokens must be >= 0, got "
+            f"{config.student_forced_answer_tokens}"
+        )
+    if (
+        config.student_max_thinking_tokens > 0
+        and config.student_forced_answer_tokens >= config.max_tokens
+    ):
+        raise ValueError(
+            "student_forced_answer_tokens must be < max_tokens when thinking is enabled; got "
+            f"student_forced_answer_tokens={config.student_forced_answer_tokens}, "
+            f"max_tokens={config.max_tokens}"
+        )
+    if (
+        config.student_max_thinking_tokens > 0
+        and config.max_tokens <= config.student_max_thinking_tokens
+    ):
+        logger.warning(
+            "max_tokens (%d) <= student_max_thinking_tokens (%d). This can starve final answer tokens. "
+            "Increase max_tokens or decrease student_max_thinking_tokens.",
+            config.max_tokens,
+            config.student_max_thinking_tokens,
         )
     if config.debug_examples_every_n_steps < 0:
         raise ValueError(
@@ -2140,6 +2169,7 @@ async def main(config: Config):
                             group_size=config.group_size,
                             max_tokens=config.max_tokens,
                             student_max_thinking_tokens=config.student_max_thinking_tokens,
+                            student_forced_answer_tokens=config.student_forced_answer_tokens,
                             temperature=config.temperature,
                             max_concurrent_generation=config.max_concurrent_generation,
                             max_concurrent_scoring=config.max_concurrent_scoring,

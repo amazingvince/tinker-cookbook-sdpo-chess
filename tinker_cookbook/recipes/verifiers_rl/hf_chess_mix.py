@@ -33,6 +33,7 @@ _UCI_FULL_RE = re.compile(r"^[a-h][1-8][a-h][1-8][qrbn]?$", flags=re.IGNORECASE)
 _THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>(.*?)</think>", flags=re.IGNORECASE | re.DOTALL)
 _THINK_OPEN_RE = re.compile(r"<think\b", flags=re.IGNORECASE)
 _THINK_CLOSE_RE = re.compile(r"</think\s*>", flags=re.IGNORECASE)
+_THINK_TAG_RE = re.compile(r"<think\b[^>]*>|</think\s*>", flags=re.IGNORECASE)
 _GAME_VERIFICATION_CACHE_KEY = "_hf_chess_mix_stockfish_verification"
 _RESPONSE_STYLE_CACHE_KEY = "_hf_chess_mix_response_style"
 logger = logging.getLogger(__name__)
@@ -927,16 +928,44 @@ def _evaluate_response_style(
             "think_tokens": 0.0,
             "response_chars": 0.0,
             "uci_count": 0.0,
+            "post_think_answer_present": 0.0,
+            "unclosed_think": 0.0,
         }
 
-    lower = stripped.lower()
-    strict_uci = _UCI_FULL_RE.fullmatch(lower) is not None
-    uci_count = len(_UCI_RE.findall(lower))
+    has_think_tag = _THINK_TAG_RE.search(stripped) is not None
+    answer_text = _answer_text_after_think_blocks(stripped)
+    answer_lower = answer_text.lower()
+    strict_uci = _UCI_FULL_RE.fullmatch(answer_lower) is not None
+    uci_count = len(_UCI_RE.findall(answer_lower))
     think_tokens = 0
     for block in _THINK_BLOCK_RE.findall(stripped):
         think_tokens += len([token for token in re.findall(r"\S+", block) if token])
 
+    depth = 0
+    unmatched_open_body_start: int | None = None
+    for match in _THINK_TAG_RE.finditer(stripped):
+        token = match.group(0).strip().lower()
+        if token.startswith("</think"):
+            if depth > 0:
+                depth -= 1
+            if depth == 0:
+                unmatched_open_body_start = None
+            continue
+        if depth == 0:
+            unmatched_open_body_start = match.end()
+        depth += 1
+    unclosed_think = depth > 0
+    if unclosed_think and unmatched_open_body_start is not None:
+        trailing_body = stripped[unmatched_open_body_start:]
+        think_tokens += len([token for token in re.findall(r"\S+", trailing_body) if token])
+
+    post_think_answer_present = float(1.0 if answer_text else 0.0)
+
     quality = 1.0
+    if has_think_tag and post_think_answer_present == 0.0:
+        quality = 0.0
+    if unclosed_think:
+        quality = 0.0
     if not strict_uci:
         quality *= max(0.0, 1.0 - max(0.0, float(non_uci_penalty)))
     if uci_count != 1:
@@ -956,6 +985,8 @@ def _evaluate_response_style(
         "think_tokens": float(think_tokens),
         "response_chars": float(len(stripped)),
         "uci_count": float(uci_count),
+        "post_think_answer_present": post_think_answer_present,
+        "unclosed_think": float(1.0 if unclosed_think else 0.0),
     }
 
 
@@ -1111,6 +1142,8 @@ class ChessMoveRubric(vf.Rubric):
         self.add_metric(self.response_strict_uci_metric)
         self.add_metric(self.response_think_tokens_metric)
         self.add_metric(self.response_chars_metric)
+        self.add_metric(self.response_post_think_answer_present_metric)
+        self.add_metric(self.response_unclosed_think_metric)
 
     @staticmethod
     def _source(info: Mapping[str, Any]) -> str:
@@ -1136,6 +1169,10 @@ class ChessMoveRubric(vf.Rubric):
                     "think_tokens": float(cached.get("think_tokens", 0.0)),
                     "response_chars": float(cached.get("response_chars", 0.0)),
                     "uci_count": float(cached.get("uci_count", 0.0)),
+                    "post_think_answer_present": float(
+                        cached.get("post_think_answer_present", 0.0)
+                    ),
+                    "unclosed_think": float(cached.get("unclosed_think", 0.0)),
                 }
 
         if not self.response_format_reward_enabled:
@@ -1145,6 +1182,8 @@ class ChessMoveRubric(vf.Rubric):
                 "think_tokens": 0.0,
                 "response_chars": float(len(_completion_to_text(completion).strip())),
                 "uci_count": 1.0,
+                "post_think_answer_present": 1.0,
+                "unclosed_think": 0.0,
             }
             state[_RESPONSE_STYLE_CACHE_KEY] = result
             return result
@@ -1465,6 +1504,30 @@ class ChessMoveRubric(vf.Rubric):
         _ = parser, info, kwargs
         style = self._response_style(completion=completion, state=state)
         return style["response_chars"]
+
+    async def response_post_think_answer_present_metric(
+        self,
+        parser: vf.Parser,
+        completion: vf.Messages,
+        info: Mapping[str, Any],
+        state: vf.State,
+        **kwargs: Any,
+    ) -> float:
+        _ = parser, info, kwargs
+        style = self._response_style(completion=completion, state=state)
+        return style["post_think_answer_present"]
+
+    async def response_unclosed_think_metric(
+        self,
+        parser: vf.Parser,
+        completion: vf.Messages,
+        info: Mapping[str, Any],
+        state: vf.State,
+        **kwargs: Any,
+    ) -> float:
+        _ = parser, info, kwargs
+        style = self._response_style(completion=completion, state=state)
+        return style["unclosed_think"]
 
 
 class HFChessMixEnv(vf.SingleTurnEnv):

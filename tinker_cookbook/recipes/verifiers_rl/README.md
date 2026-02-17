@@ -194,6 +194,10 @@ If enabled, teacher reprompts can include:
 
 `student_max_thinking_tokens` limits tokens inside `<think>...</think>` blocks during student rollout
 generation (set `0` to disable).
+`student_forced_answer_tokens` reserves a small continuation budget to force a final answer pass
+when a rollout remains in thinking mode.
+When thinking is enabled, set `max_tokens` comfortably above `student_max_thinking_tokens`
+(for example, `max_tokens >= student_max_thinking_tokens + 32`).
 
 Default teacher templates treat solution/feedback/hints as private context and explicitly instruct
 the teacher to answer as if independently derived, without referencing those auxiliary signals.
